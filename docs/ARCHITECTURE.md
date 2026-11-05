@@ -4,6 +4,26 @@ This document explains how Topebag is put together and why. It's meant for
 anyone changing or extending the code. For usage, see the
 [README](../README.md). For API-level docs, run `cargo doc --open`.
 
+## The workflow
+
+In the app, a link goes through **link → edit → format → preview → print**:
+
+1. `pipeline::add_url` fetches the link and saves it as a document: the
+   cleaned `article.html`, a **draft** (`document.json`) that splits it into
+   blocks and records the default format, and a first PDF.
+2. The editor (`gui/mod.rs`) loads the draft with `pipeline::load_draft`.
+   Every edit or format change marks the document dirty.
+3. About 450 ms after the last change, the draft goes to the worker's
+   rebuild thread, which calls `pipeline::rebuild` (save the draft, convert
+   the included blocks, typeset, write the PDF) and renders preview pages
+   from the same layout.
+4. Printing is a separate, explicit request (`pipeline::print_entry`) that
+   prints the latest layout. The Print button is disabled while a rebuild is
+   pending, so what you print is always what you saw.
+
+The CLI uses the same functions: `add` (optionally `--print`) and
+`retypeset`, which rebuilds from the draft.
+
 ## The pipeline
 
 Adding a link runs one linear pipeline (`pipeline::add_url`):
@@ -87,16 +107,17 @@ apart.
 | `browser.rs` | Headless Edge/Chrome | `find_browser`, `dump_dom`, `open_sign_in_window`, `profile_dir`, `matches_site` |
 | `extract.rs` | Reader mode | `extract` → `Article` |
 | `images.rs` | Image pipeline | `ImageResolver`, `Downloader`, `StoredImages`, `NoImages` |
+| `document.rs` | Editable drafts | `Draft`, `Block`, `BlockKind`, `split_blocks`, `html_to_markdown`, `markdown_to_html` |
 | `convert.rs` | HTML → Typst | `html_to_typst`, `html_to_plain_typst`, `escape_text`, `string_literal` |
 | `typeset.rs` | Typst integration | `main_source`, `compile`, `pdf`, `render_page`, fonts and `World` |
 | `library.rs` | Storage | `Library`, `Entry`, `PrintRecord`, `data_dir` |
-| `pipeline.rs` | Workflows | `add_url` (acquire → article or PDF), `print_entry`, `retypeset`, `render_previews` |
+| `pipeline.rs` | Workflows | `add_url` (acquire → article or PDF), `load_draft`, `rebuild`, `print_entry`, `retypeset`, `render_previews` |
 | `instapaper.rs` | Reading-queue feeds | `parse_feed`, `fetch_feed`, `QueueState` (`observe`, `unseen`, `mark_seen`) |
 | `search.rs` | Library search | `parse_query`, `SearchIndex::matches` → `Hit` with snippet |
 | `instance.rs` | Single instance | `claim` → `Role::{Primary, Secondary}`, `Primary::listen` |
 | `autostart.rs` | Start with Windows | `set_enabled`, `is_enabled` (per-user `Run` key) |
 | `print/` | Printing | `printers`, `default_printer`, `print` (Windows GDI / CUPS) |
-| `settings.rs` | Preferences | `Settings` and enums |
+| `settings.rs` | Preferences | `Settings`, per-document `Format`, enums |
 | `main.rs`, `cli.rs` | Executable | GUI by default; subcommands for the CLI |
 | `gui/` | Desktop app | `App` (UI state), `worker` (threads), `tray`, `theme` |
 | `assets/topebag.typ` | Document template | `tb-article`, `tb-figure`, `tb-table`, … |
@@ -159,6 +180,44 @@ between them. Notable rules:
   tables or quotes stay in place.
 - Images use their HTML `width`/`height` when those are smaller than the
   pixel size, because high-DPI sites serve 2× images.
+
+### Drafts: editing by blocks
+
+`document::split_blocks` walks the cleaned article HTML and returns
+top-level blocks. It looks *through* wrapper elements (`div`, `section`,
+`span`, `font`…) that contain block content. Loose inline text between
+blocks becomes its own paragraph block. A paragraph or wrapper holding only
+an image is an image block, and empty blocks are dropped. Each block keeps
+its original HTML and a stable `id`.
+
+A block can be **excluded**, **moved**, or **edited**. Edits round-trip
+through light Markdown: `html_to_markdown` turns the block's inline HTML into
+`**bold**`, `*italic*`, `` `code` ``, `[link](url)` (lists become `- item`
+lines, quotes become paragraphs, code stays raw), and `markdown_to_html`
+(pulldown-cmark) turns the edited text back into HTML of the same kind.
+`Draft::html()` joins the included blocks in order, and that HTML goes
+through the same safe `convert::html_to_typst` as before. So edited text can
+never inject Typst syntax, and "Restore original" just re-splits
+`article.html`.
+
+The draft also stores the masthead (`Meta`: title, byline, date, plus the
+original values) and the document's own `Format`. `Settings.format` is
+flattened into `settings.json`, so settings files from before per-document
+formatting still load and supply the defaults. Entries saved before drafts
+existed get a draft made from their `article.html` the first time they're
+opened.
+
+**Images during edits.** Live rebuilds are offline: `RefillImages` only
+replays stored images. The first rebuild after opening a document, and the
+*Fetch missing images* button, also download images that aren't stored yet
+(skipping URLs known to be icons, kept in `entry.rejected_images`).
+Grayscale is per document: `GrayImages` makes `gray-NNN` copies on demand
+from the colour originals, so switching it never re-downloads.
+
+**The rebuild thread** (`gui/worker.rs`) coalesces requests: while it's
+busy, newer drafts of the same document replace older ones, so a burst of
+typing costs one rebuild. Pending edits of a document you switch away from
+are still rebuilt and saved.
 
 ### Side-by-side spreads and the spacing optimizer
 
@@ -366,6 +425,11 @@ in a new `print/` submodule and select it with `cfg` in `print/mod.rs`.
   entirely by **JavaScript** (headless-browser fallback), and a site that
   returns **403 to robots** but serves browsers. The browser tests skip
   themselves if Edge/Chrome is missing or can't run in the environment.
+- **Editing tests** cover block splitting through wrappers, the Markdown
+  round trip (inline formatting and escaping), moving and restoring drafts,
+  and an end-to-end flow: add → drop blocks → rewrite and move a heading →
+  rename → rebuild (checking the Typst, the library title and the search
+  text) → refill missing images → per-document grayscale → restore original.
 - **Spread tests** check that side-by-side sheets are landscape, that the
   optimizer reaches the compact sheet count with near-minimal tightening
   (and leaves one-sheet articles alone), that re-typesetting switches between

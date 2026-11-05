@@ -6,9 +6,14 @@
 //! * [`Downloader`] fetches images from the web, normalises them for print
 //!   (downscale, optional grayscale, re-encode as JPEG/PNG) and writes them
 //!   into the entry's `img/` folder. Used when a URL is first added.
-//! * [`StoredImages`] replays images that were downloaded earlier. Used when
-//!   a saved document is re-typeset with new settings — no network needed.
-//! * [`NoImages`] drops every image (the "Include images" setting is off).
+//! * [`StoredImages`] replays images that were downloaded earlier.
+//! * [`RefillImages`] replays stored images and downloads any that are
+//!   missing (for example ones an older version failed to fetch).
+//! * [`GrayImages`] wraps another resolver and hands out grayscale copies,
+//!   so "grayscale" can be switched per document without re-downloading.
+//! * [`NoImages`] drops every image (the "Include images" option is off).
+//!
+//! Downloads always keep full-colour originals in `img/`.
 
 use std::collections::HashMap;
 use std::fs;
@@ -87,29 +92,44 @@ impl ImageResolver for StoredImages {
 pub struct Downloader<'a> {
     dir: PathBuf,
     referer: Option<Url>,
-    grayscale: bool,
     cache: HashMap<String, Option<StoredImage>>,
+    /// Number used for the next file name (`001.jpg`, `002.png`, …).
+    next_index: usize,
     /// Every image successfully stored, in document order.
     pub stored: Vec<StoredImage>,
     /// Images that could not be included (download or decoding failed).
     /// Icons and tracking pixels that are dropped on purpose are not listed.
     pub skipped: Vec<String>,
+    /// URLs dropped on purpose (icons, tracking pixels): never worth retrying.
+    pub rejected: Vec<String>,
     /// Called after each download attempt with (attempted, stored).
     progress: Option<Box<dyn FnMut(usize, usize) + 'a>>,
 }
 
 impl<'a> Downloader<'a> {
     /// Create a downloader writing into `dir` (created if needed).
-    pub fn new(dir: impl Into<PathBuf>, referer: Option<Url>, grayscale: bool) -> Self {
+    pub fn new(dir: impl Into<PathBuf>, referer: Option<Url>) -> Self {
         Self {
             dir: dir.into(),
             referer,
-            grayscale,
             cache: HashMap::new(),
+            next_index: 1,
             stored: Vec::new(),
             skipped: Vec::new(),
+            rejected: Vec::new(),
             progress: None,
         }
+    }
+
+    /// Continue numbering after images that already exist in the folder.
+    pub fn after_existing(mut self, existing: &[StoredImage]) -> Self {
+        let highest = existing
+            .iter()
+            .filter_map(|i| i.file.split('.').next().and_then(|stem| stem.parse::<usize>().ok()))
+            .max()
+            .unwrap_or(0);
+        self.next_index = highest + 1;
+        self
     }
 
     /// Register a callback invoked after each image download attempt.
@@ -120,10 +140,10 @@ impl<'a> Downloader<'a> {
 
     fn fetch_and_store(&mut self, url: &Url) -> Result<StoredImage> {
         let resource = fetch::fetch_resource(url, self.referer.as_ref())?;
-        let index = self.stored.len() + 1;
-        let stem = format!("{index:03}");
+        let stem = format!("{:03}", self.next_index);
         fs::create_dir_all(&self.dir)?;
-        let normalized = normalize(&resource.bytes, resource.content_type.as_deref(), self.grayscale)?;
+        let normalized = normalize(&resource.bytes, resource.content_type.as_deref(), false)?;
+        self.next_index += 1;
         let file = format!("{stem}.{}", normalized.extension);
         fs::write(self.dir.join(&file), &normalized.bytes)
             .with_context(|| format!("saving image {file}"))?;
@@ -153,7 +173,9 @@ impl ImageResolver for Downloader<'_> {
             }
             Err(err) => {
                 log::info!("skipping image {url}: {err:#}");
-                if !format!("{err}").contains("icon-sized") {
+                if format!("{err}").contains("icon-sized") {
+                    self.rejected.push(url.to_string());
+                } else {
                     self.skipped.push(format!("{url}: {err:#}"));
                 }
                 None
@@ -164,6 +186,95 @@ impl ImageResolver for Downloader<'_> {
             progress(self.cache.len(), self.stored.len());
         }
         outcome
+    }
+}
+
+/// Resolver that uses stored images and downloads the ones that are
+/// missing (skipping URLs known to be icons).
+pub struct RefillImages<'a> {
+    by_url: HashMap<String, StoredImage>,
+    existing: Vec<StoredImage>,
+    rejected: Vec<String>,
+    downloader: Downloader<'a>,
+}
+
+impl<'a> RefillImages<'a> {
+    pub fn new(existing: &[StoredImage], rejected: &[String], dir: impl Into<PathBuf>, referer: Option<Url>) -> Self {
+        Self {
+            by_url: existing.iter().map(|i| (i.source_url.clone(), i.clone())).collect(),
+            existing: existing.to_vec(),
+            rejected: rejected.to_vec(),
+            downloader: Downloader::new(dir, referer).after_existing(existing),
+        }
+    }
+
+    /// A stored image, without downloading anything.
+    pub fn stored(&self, url: &Url) -> Option<StoredImage> {
+        self.by_url.get(url.as_str()).cloned()
+    }
+
+    /// All images now available (old and newly downloaded), plus the updated
+    /// list of rejected URLs and how many images still failed.
+    pub fn finish(self) -> (Vec<StoredImage>, Vec<String>, usize) {
+        let mut images = self.existing;
+        images.extend(self.downloader.stored);
+        let mut rejected = self.rejected;
+        rejected.extend(self.downloader.rejected);
+        (images, rejected, self.downloader.skipped.len())
+    }
+}
+
+impl ImageResolver for RefillImages<'_> {
+    fn resolve(&mut self, url: &Url) -> Option<StoredImage> {
+        if let Some(hit) = self.by_url.get(url.as_str()) {
+            return Some(hit.clone());
+        }
+        if self.rejected.iter().any(|r| r == url.as_str()) {
+            return None;
+        }
+        self.downloader.resolve(url)
+    }
+}
+
+/// Wraps a resolver and hands out grayscale copies (`gray-001.jpg`), made on
+/// first use and kept next to the originals.
+pub struct GrayImages<'r> {
+    inner: &'r mut dyn ImageResolver,
+    dir: PathBuf,
+}
+
+impl<'r> GrayImages<'r> {
+    pub fn new(inner: &'r mut dyn ImageResolver, dir: impl Into<PathBuf>) -> Self {
+        Self { inner, dir: dir.into() }
+    }
+}
+
+impl ImageResolver for GrayImages<'_> {
+    fn resolve(&mut self, url: &Url) -> Option<StoredImage> {
+        let original = self.inner.resolve(url)?;
+        if original.file.ends_with(".svg") {
+            return Some(original); // vectors stay as they are
+        }
+        let gray_file = format!("gray-{}", original.file);
+        let gray_path = self.dir.join(&gray_file);
+        if !gray_path.exists() {
+            let made = (|| -> Result<()> {
+                let img = image::open(self.dir.join(&original.file))?;
+                let gray = DynamicImage::ImageLumaA8(img.to_luma_alpha8());
+                if original.file.ends_with(".png") {
+                    gray.save(&gray_path)?;
+                } else {
+                    let mut out = std::fs::File::create(&gray_path)?;
+                    gray.to_luma8().write_with_encoder(image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 85))?;
+                }
+                Ok(())
+            })();
+            if let Err(err) = made {
+                log::warn!("could not make a grayscale copy of {}: {err:#}", original.file);
+                return Some(original);
+            }
+        }
+        Some(StoredImage { file: gray_file, ..original })
     }
 }
 
@@ -280,6 +391,38 @@ mod tests {
     fn transparent_png_stays_png() {
         let n = normalize(&png(100, 100, 0), None, true).unwrap();
         assert_eq!(n.extension, "png");
+    }
+
+    struct Fixed(StoredImage);
+    impl ImageResolver for Fixed {
+        fn resolve(&mut self, _url: &Url) -> Option<StoredImage> {
+            Some(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn grayscale_copies_are_made_once_and_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("001.png"), png(80, 60, 255)).unwrap();
+        let stored = StoredImage { source_url: "https://x/a.png".into(), file: "001.png".into(), width: 80, height: 60 };
+        let mut inner = Fixed(stored);
+        let mut gray = GrayImages::new(&mut inner, dir.path());
+        let url = Url::parse("https://x/a.png").unwrap();
+        let got = gray.resolve(&url).unwrap();
+        assert_eq!(got.file, "gray-001.png");
+        let pixel = image::open(dir.path().join("gray-001.png")).unwrap().to_rgba8().get_pixel(1, 1).0;
+        assert_eq!(pixel[0], pixel[1], "grayscale: channels equal");
+        assert_eq!(gray.resolve(&url).unwrap().file, "gray-001.png");
+    }
+
+    #[test]
+    fn numbering_continues_after_existing_images() {
+        let existing = vec![
+            StoredImage { source_url: "a".into(), file: "001.jpg".into(), width: 1, height: 1 },
+            StoredImage { source_url: "b".into(), file: "007.png".into(), width: 1, height: 1 },
+        ];
+        let d = Downloader::new("x", None).after_existing(&existing);
+        assert_eq!(d.next_index, 8);
     }
 
     #[test]

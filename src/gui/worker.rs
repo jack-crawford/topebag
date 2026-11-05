@@ -2,26 +2,31 @@
 //!
 //! The UI thread must never block, so all slow work happens elsewhere:
 //!
-//! * One **job thread** processes [`Request`]s in order (fetching, typesetting,
-//!   printing). Running jobs one at a time keeps print order predictable and
-//!   avoids hammering sites with parallel downloads.
-//! * **Previews** are rendered on short-lived threads of their own, so
-//!   browsing the library stays snappy even while a long job is running.
+//! * One **job thread** processes [`Request`]s in order (fetching links,
+//!   printing, feed checks). Running jobs one at a time keeps print order
+//!   predictable and avoids hammering sites with parallel downloads.
+//! * One **rebuild thread** turns the editor's drafts into fresh PDFs and
+//!   preview pages. While you type, it only ever works on the *latest* draft
+//!   of each document, so a burst of edits costs one rebuild, not dozens.
+//! * **Previews** of unchanged documents and the **search index** are built
+//!   on short-lived threads of their own.
 //!
 //! Results come back as [`Event`]s over a channel; every send is followed by
 //! `request_repaint()` so the UI wakes up and picks them up.
 
+use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, Sender, channel};
 
 use eframe::egui;
 
+use topebag::document::Draft;
 use topebag::instapaper::{self, FeedItem};
 use topebag::library::{Entry, Library, PrintRecord};
 use topebag::pipeline::{self, PrintTarget};
 use topebag::print::{self, PrinterInfo};
 use topebag::search::SearchIndex;
 use topebag::settings::Settings;
-use topebag::typeset::RasterPage;
+use topebag::typeset::{self, RasterPage};
 use url::Url;
 
 /// Identifies a job in the activity list.
@@ -29,22 +34,29 @@ pub type JobId = u64;
 
 /// Work for the job thread.
 pub enum Request {
-    Add { job: JobId, url: Url, settings: Settings, print: bool },
+    Add { job: JobId, url: Url, settings: Settings },
     Print { job: JobId, id: String, settings: Settings },
-    Retypeset { job: JobId, id: String, settings: Settings },
     RefreshPrinters,
     CheckFeed { url: Url },
+}
+
+/// A draft to rebuild (see [`Worker::rebuild`]).
+pub struct Rebuild {
+    pub id: String,
+    pub draft: Draft,
+    /// Download images that aren't stored yet.
+    pub refill_images: bool,
 }
 
 /// Results reported back to the UI.
 pub enum Event {
     Progress { job: JobId, stage: String },
-    Added { job: JobId, entry: Box<Entry>, print: Option<Result<PrintRecord, String>> },
+    Added { job: JobId, entry: Box<Entry> },
     Printed { job: JobId, record: PrintRecord },
-    Retypeset { job: JobId, entry: Box<Entry> },
     Failed { job: JobId, error: String },
     Printers(Result<Vec<PrinterInfo>, String>),
     Preview { id: String, result: Result<Vec<RasterPage>, String> },
+    Rebuilt { id: String, result: Result<(Box<Entry>, Vec<RasterPage>), String> },
     Feed(Result<Vec<FeedItem>, String>),
     Index(Box<SearchIndex>),
 }
@@ -52,6 +64,7 @@ pub enum Event {
 /// Handle to the background threads.
 pub struct Worker {
     requests: Sender<Request>,
+    rebuilds: Sender<Rebuild>,
     events_tx: Sender<Event>,
     pub events: Receiver<Event>,
     library: Library,
@@ -60,29 +73,70 @@ pub struct Worker {
 
 /// Resolution of on-screen previews.
 const PREVIEW_DPI: f32 = 120.0;
+/// Pages rendered for a preview (long documents still print in full).
+const PREVIEW_PAGES: usize = 40;
 
 impl Worker {
     pub fn spawn(ctx: egui::Context, library: Library) -> Worker {
         let (requests, request_rx) = channel::<Request>();
+        let (rebuilds, rebuild_rx) = channel::<Rebuild>();
         let (events_tx, events) = channel::<Event>();
 
-        let thread_events = events_tx.clone();
-        let thread_ctx = ctx.clone();
-        let thread_library = library.clone();
+        let (job_events, job_ctx, job_library) = (events_tx.clone(), ctx.clone(), library.clone());
         std::thread::Builder::new()
             .name("topebag-jobs".into())
             .spawn(move || {
                 for request in request_rx {
-                    process(request, &thread_library, &thread_events, &thread_ctx);
+                    process(request, &job_library, &job_events, &job_ctx);
                 }
             })
             .expect("failed to start worker thread");
 
-        Worker { requests, events_tx, events, library, ctx }
+        let (rb_events, rb_ctx, rb_library) = (events_tx.clone(), ctx.clone(), library.clone());
+        std::thread::Builder::new()
+            .name("topebag-rebuild".into())
+            .spawn(move || {
+                while let Ok(first) = rebuild_rx.recv() {
+                    // Coalesce: keep only the newest draft per document, but
+                    // never drop a document's pending edits.
+                    let mut pending: Vec<String> = vec![first.id.clone()];
+                    let mut latest: HashMap<String, Rebuild> = HashMap::from([(first.id.clone(), first)]);
+                    while let Ok(next) = rebuild_rx.try_recv() {
+                        if !latest.contains_key(&next.id) {
+                            pending.push(next.id.clone());
+                        }
+                        let refill = latest.get(&next.id).is_some_and(|r| r.refill_images);
+                        let mut next = next;
+                        next.refill_images |= refill;
+                        latest.insert(next.id.clone(), next);
+                    }
+                    for id in pending {
+                        let Some(job) = latest.remove(&id) else { continue };
+                        let result = pipeline::rebuild(&rb_library, &job.id, &job.draft, job.refill_images)
+                            .map(|rebuilt| {
+                                let pages = (0..rebuilt.compiled.page_count().min(PREVIEW_PAGES))
+                                    .filter_map(|i| typeset::render_page(&rebuilt.compiled.document, i, PREVIEW_DPI))
+                                    .collect();
+                                (Box::new(rebuilt.entry), pages)
+                            })
+                            .map_err(|e| format!("{e:#}"));
+                        let _ = rb_events.send(Event::Rebuilt { id: job.id, result });
+                        rb_ctx.request_repaint();
+                    }
+                }
+            })
+            .expect("failed to start rebuild thread");
+
+        Worker { requests, rebuilds, events_tx, events, library, ctx }
     }
 
     pub fn send(&self, request: Request) {
         let _ = self.requests.send(request);
+    }
+
+    /// Rebuild a document from an edited draft (latest wins).
+    pub fn rebuild(&self, rebuild: Rebuild) {
+        let _ = self.rebuilds.send(rebuild);
     }
 
     /// Build the full-text search index on a separate thread.
@@ -110,13 +164,18 @@ impl Worker {
             .expect("failed to start heartbeat thread");
     }
 
-    /// Render previews for entry `id` on a separate thread.
+    /// Render previews of a saved document on a separate thread.
     pub fn preview(&self, id: String) {
         let tx = self.events_tx.clone();
         let ctx = self.ctx.clone();
         let library = self.library.clone();
         std::thread::spawn(move || {
-            let result = pipeline::render_previews(&library, &id, PREVIEW_DPI).map_err(|e| format!("{e:#}"));
+            let result = pipeline::render_previews(&library, &id, PREVIEW_DPI)
+                .map(|mut pages| {
+                    pages.truncate(PREVIEW_PAGES);
+                    pages
+                })
+                .map_err(|e| format!("{e:#}"));
             let _ = tx.send(Event::Preview { id, result });
             ctx.request_repaint();
         });
@@ -129,15 +188,10 @@ fn process(request: Request, library: &Library, events: &Sender<Event>, ctx: &eg
         ctx.request_repaint();
     };
     match request {
-        Request::Add { job, url, settings, print } => {
-            let target = PrintTarget::default();
+        Request::Add { job, url, settings } => {
             let mut progress = |stage: pipeline::Stage| send(Event::Progress { job, stage: stage.to_string() });
-            match pipeline::add_url(library, &settings, &url, print.then_some(&target), &mut progress) {
-                Ok(outcome) => send(Event::Added {
-                    job,
-                    entry: Box::new(outcome.entry),
-                    print: outcome.print.map(|r| r.map_err(|e| format!("{e:#}"))),
-                }),
+            match pipeline::add_url(library, &settings, &url, None, &mut progress) {
+                Ok(outcome) => send(Event::Added { job, entry: Box::new(outcome.entry) }),
                 Err(err) => send(Event::Failed { job, error: format!("{err:#}") }),
             }
         }
@@ -146,13 +200,6 @@ fn process(request: Request, library: &Library, events: &Sender<Event>, ctx: &eg
             send(Event::Progress { job, stage: format!("Sending to {printer}…") });
             match pipeline::print_entry(library, &id, &settings, &PrintTarget::default()) {
                 Ok(record) => send(Event::Printed { job, record }),
-                Err(err) => send(Event::Failed { job, error: format!("{err:#}") }),
-            }
-        }
-        Request::Retypeset { job, id, settings } => {
-            send(Event::Progress { job, stage: "Typesetting…".into() });
-            match pipeline::retypeset(library, &id, &settings) {
-                Ok(entry) => send(Event::Retypeset { job, entry: Box::new(entry) }),
                 Err(err) => send(Event::Failed { job, error: format!("{err:#}") }),
             }
         }

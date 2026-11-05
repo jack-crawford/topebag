@@ -181,26 +181,18 @@ impl BrowserMode {
     }
 }
 
-/// All user-tweakable options.
+/// How one document is laid out. Every document has its own copy (set in
+/// its Format tab); [`Settings::format`] holds the defaults for new ones.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
-pub struct Settings {
-    /// Printer to use. `None` means the system default printer.
-    pub printer: Option<String>,
-    /// Print immediately after a URL has been typeset.
-    pub auto_print: bool,
-    /// Number of copies per print job.
-    pub copies: u16,
-    /// Raster resolution for printing.
-    pub print_quality: PrintQuality,
-
+pub struct Format {
     /// Paper size the PDF is laid out for.
     pub paper: Paper,
     /// Body text size in points.
     pub font_size: f32,
     /// Body typeface.
     pub typeface: Typeface,
-    /// Number of text columns (1 or 2).
+    /// Number of text columns (1 or 2). Not used with side-by-side spreads.
     pub columns: u8,
     /// Justify paragraphs (with hyphenation) instead of ragged-right.
     pub justify: bool,
@@ -209,15 +201,60 @@ pub struct Settings {
     /// With side-by-side spreads: tighten spacing just enough to use the
     /// fewest sheets (never below 8.5 pt text).
     pub fit_to_sheets: bool,
-
     /// Include images from the article.
     pub include_images: bool,
-    /// Convert images to grayscale (saves colour ink).
+    /// Print images in grayscale (saves colour ink).
     pub grayscale_images: bool,
     /// How links are shown on paper.
     pub link_style: LinkStyle,
     /// Print a QR code linking back to the original page in the header.
     pub qr_code: bool,
+}
+
+impl Default for Format {
+    fn default() -> Self {
+        Self {
+            paper: Paper::system_default(),
+            font_size: 11.0,
+            typeface: Typeface::Serif,
+            columns: 1,
+            justify: true,
+            side_by_side: false,
+            fit_to_sheets: true,
+            include_images: true,
+            grayscale_images: false,
+            link_style: LinkStyle::Plain,
+            qr_code: true,
+        }
+    }
+}
+
+impl Format {
+    /// Clamp values into supported ranges.
+    pub fn sanitize(&mut self) {
+        self.columns = self.columns.clamp(1, 2);
+        if !self.font_size.is_finite() {
+            self.font_size = 11.0;
+        }
+        self.font_size = self.font_size.clamp(7.0, 18.0);
+    }
+}
+
+/// All user-tweakable options.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Settings {
+    /// Printer to use. `None` means the system default printer.
+    pub printer: Option<String>,
+    /// Number of copies per print job.
+    pub copies: u16,
+    /// Raster resolution for printing.
+    pub print_quality: PrintQuality,
+
+    /// Formatting for new documents. Stored flat in `settings.json`, so
+    /// settings files from earlier versions keep working.
+    #[serde(flatten)]
+    pub format: Format,
 
     /// When to use the headless browser.
     pub browser_mode: BrowserMode,
@@ -226,7 +263,8 @@ pub struct Settings {
 
     /// Private RSS feed of your Instapaper "Unread" folder (or any feed).
     pub instapaper_feed: Option<String>,
-    /// Print new Instapaper saves automatically while Topebag is running.
+    /// Fetch new Instapaper saves into the library automatically while
+    /// Topebag is running (they are never printed without you).
     pub instapaper_auto: bool,
     /// Minutes between Instapaper checks.
     pub instapaper_interval_min: u32,
@@ -241,20 +279,9 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             printer: None,
-            auto_print: true,
             copies: 1,
             print_quality: PrintQuality::Standard,
-            paper: Paper::system_default(),
-            font_size: 11.0,
-            typeface: Typeface::Serif,
-            columns: 1,
-            justify: true,
-            side_by_side: false,
-            fit_to_sheets: true,
-            include_images: true,
-            grayscale_images: false,
-            link_style: LinkStyle::Plain,
-            qr_code: true,
+            format: Format::default(),
             browser_mode: BrowserMode::Auto,
             browser_sites: Vec::new(),
             instapaper_feed: None,
@@ -297,11 +324,7 @@ impl Settings {
     /// Clamp values into supported ranges.
     pub fn sanitize(&mut self) {
         self.copies = self.copies.clamp(1, 99);
-        self.columns = self.columns.clamp(1, 2);
-        if !self.font_size.is_finite() {
-            self.font_size = 11.0;
-        }
-        self.font_size = self.font_size.clamp(7.0, 18.0);
+        self.format.sanitize();
         if self.printer.as_deref().is_some_and(|p| p.trim().is_empty()) {
             self.printer = None;
         }
@@ -332,14 +355,23 @@ mod tests {
         fs::write(&path, r#"{ "copies": 3, "columns": 9 }"#).unwrap();
         let s = Settings::load(&path).unwrap();
         assert_eq!(s.copies, 3);
-        assert_eq!(s.columns, 2, "columns are clamped");
-        assert!(s.auto_print, "missing fields use defaults");
+        assert_eq!(s.format.columns, 2, "columns are clamped (and read from the flat file)");
+        assert!(s.format.include_images, "missing fields use defaults");
 
         s.save(&path).unwrap();
         assert_eq!(Settings::load(&path).unwrap(), s);
 
         // A file saved with a UTF-8 byte-order mark still loads.
         fs::write(&path, "\u{feff}{ \"side_by_side\": true }").unwrap();
-        assert!(Settings::load(&path).unwrap().side_by_side);
+        assert!(Settings::load(&path).unwrap().format.side_by_side);
+
+        // Settings from before per-document formatting (with auto_print) load.
+        fs::write(&path, r#"{ "auto_print": true, "paper": "A4", "printer": "Brother" }"#).unwrap();
+        let old = Settings::load(&path).unwrap();
+        assert_eq!(old.format.paper, Paper::A4);
+        assert_eq!(old.printer.as_deref(), Some("Brother"));
+        // ...and are saved flat, as before.
+        old.save(&path).unwrap();
+        assert!(fs::read_to_string(&path).unwrap().contains("\"paper\": \"A4\""));
     }
 }

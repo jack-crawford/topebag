@@ -122,6 +122,9 @@ pub struct Entry {
     /// How much spacing was tightened to save sheets (0 = none, 1 = most).
     #[serde(default)]
     pub density: f64,
+    /// Image URLs dropped on purpose (icons, tracking pixels); never retried.
+    #[serde(default)]
+    pub rejected_images: Vec<String>,
 }
 
 impl Entry {
@@ -231,6 +234,11 @@ impl Library {
             bail!("invalid entry id `{id}`");
         }
         Ok(self.root.join(id))
+    }
+
+    /// Path of the entry's editable draft (`document.json`).
+    pub fn draft_path(&self, id: &str) -> Result<PathBuf> {
+        Ok(self.dir(id)?.join("document.json"))
     }
 
     /// Path of the entry's PDF.

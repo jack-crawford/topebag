@@ -1,10 +1,13 @@
 //! The end-to-end workflow, shared by the GUI and the CLI.
 //!
-//! * [`add_url`] — fetch → extract → images → convert → typeset → save PDF →
-//!   (optionally) print. This is what happens when you paste a link.
-//! * [`print_entry`] — print a saved document again.
-//! * [`retypeset`] — rebuild a saved document with the current settings
-//!   (paper size, font, columns…) using its stored HTML and images.
+//! * [`add_url`] — fetch → extract → draft (blocks) → images → convert →
+//!   typeset → save PDF → (only if asked) print. This is what happens when
+//!   you paste a link; the result is a draft you can edit, format and preview.
+//! * [`load_draft`] / [`rebuild`] — the editor's loop: load a document's
+//!   draft, and rebuild its PDF after edits or format changes.
+//! * [`print_entry`] — print a saved document.
+//! * [`retypeset`] — rebuild a saved document from its draft (used by the
+//!   CLI), downloading any images that were missing.
 //! * [`render_previews`] — rasterise pages for the on-screen preview.
 //!
 //! Progress is reported through a [`Stage`] callback so the UI can show
@@ -20,12 +23,13 @@ use url::Url;
 
 use crate::browser;
 use crate::convert::{self, ConvertOptions};
+use crate::document::{Draft, Meta};
 use crate::extract;
 use crate::fetch;
-use crate::images::{Downloader, ImageResolver, NoImages, StoredImages};
+use crate::images::{Downloader, GrayImages, ImageResolver, NoImages, RefillImages};
 use crate::library::{Entry, EntryKind, Library, PrintRecord};
 use crate::print::{self, PrintRequest};
-use crate::settings::{BrowserMode, Settings};
+use crate::settings::{BrowserMode, Format, Settings};
 use crate::typeset::{self, Compiled, DocMeta, RasterPage};
 
 /// A step in the pipeline, for progress reporting.
@@ -206,26 +210,31 @@ fn add_article(
             entry.warnings.push("No article was detected on this page, so the whole page body was used.".into());
         }
 
-        // Images are downloaded lazily while the HTML is converted.
-        let body = if settings.include_images {
+        let meta = Meta {
+            title: article.title.clone(),
+            byline: article.byline.clone(),
+            published: article.published.clone(),
+        };
+        let draft = Draft::from_article(&article.content_html, meta, settings.format.clone());
+
+        // Images are downloaded lazily while the HTML is converted, then the
+        // document is typeset; both report progress through one callback.
+        let compiled = if draft.format.include_images {
             progress(Stage::Images(0, 0));
-            let mut downloader =
-                Downloader::new(dir.join("img"), Some(final_url.clone()), settings.grayscale_images)
-                    .on_progress(|tried, stored| progress(Stage::Images(tried, stored)));
-            let body = convert_body(&entry, settings, final_url, &article.content_html, &mut downloader);
+            let shared = std::cell::RefCell::new(&mut *progress);
+            let mut downloader = Downloader::new(dir.join("img"), Some(final_url.clone()))
+                .on_progress(|tried, stored| (shared.borrow_mut())(Stage::Images(tried, stored)));
+            let compiled =
+                typeset_draft(&dir, &mut entry, &draft, &mut downloader, &mut |stage| (shared.borrow_mut())(stage))?;
             if !downloader.skipped.is_empty() {
                 entry.warnings.push(format!("{} image(s) could not be included.", downloader.skipped.len()));
             }
             entry.images = std::mem::take(&mut downloader.stored);
-            body
+            entry.rejected_images = std::mem::take(&mut downloader.rejected);
+            compiled
         } else {
-            convert_body(&entry, settings, final_url, &article.content_html, &mut NoImages)
+            typeset_draft(&dir, &mut entry, &draft, &mut NoImages, &mut |stage| progress(stage))?
         };
-
-        progress(Stage::Typesetting);
-        let (compiled, density) = build(&dir, &entry, settings, &body)?;
-        entry.spread = settings.side_by_side;
-        entry.density = density;
         // Font fallbacks are expected (not every system has every font), so
         // they are logged rather than shown to the user.
         for warning in &compiled.warnings {
@@ -236,8 +245,6 @@ fn add_article(
             .extend(compiled.warnings.iter().filter(|w| !w.contains("unknown font family")).take(5).cloned());
 
         progress(Stage::Saving);
-        write_pdf(&dir, &compiled)?;
-        entry.pages = compiled.page_count();
         library.save(&entry)?;
 
         let print = print.map(|target| print_new_entry(library, settings, &mut entry, &compiled, target, progress));
@@ -353,29 +360,128 @@ pub fn print_entry(library: &Library, id: &str, settings: &Settings, target: &Pr
     Ok(record)
 }
 
-/// Rebuild a saved document with the current settings. Images that were
-/// downloaded before are reused; nothing is fetched from the network.
-pub fn retypeset(library: &Library, id: &str, settings: &Settings) -> Result<Entry> {
-    let mut entry = library.entry(id)?;
+/// Load a document's draft for editing.
+///
+/// Returns `None` for PDF entries (they print as they are). Entries saved
+/// before drafts existed get one made from their stored article HTML, with
+/// `defaults` as formatting (keeping their side-by-side layout if they had
+/// one). Nothing is written until the draft is rebuilt.
+pub fn load_draft(library: &Library, id: &str, defaults: &Format) -> Result<Option<Draft>> {
+    let entry = library.entry(id)?;
     if entry.kind == EntryKind::Pdf {
-        // PDFs are printed as they are; there is nothing to re-typeset.
-        return Ok(entry);
+        return Ok(None);
     }
+    let path = library.draft_path(id)?;
+    if path.exists() {
+        return Draft::load(&path).map(Some);
+    }
+    let html = fs::read_to_string(library.dir(id)?.join("article.html")).context("this entry has no stored article HTML")?;
+    let meta = Meta { title: entry.title.clone(), byline: entry.byline.clone(), published: entry.published.clone() };
+    let format = Format { side_by_side: entry.spread || defaults.side_by_side, ..defaults.clone() };
+    Ok(Some(Draft::from_article(&html, meta, format)))
+}
+
+/// The article HTML a draft started from (for "Restore original").
+pub fn original_html(library: &Library, id: &str) -> Result<String> {
+    fs::read_to_string(library.dir(id)?.join("article.html")).context("this entry has no stored article HTML")
+}
+
+/// Result of [`rebuild`].
+pub struct Rebuilt {
+    pub entry: Entry,
+    pub compiled: Compiled,
+}
+
+/// Save `draft` and rebuild the document's PDF from it.
+///
+/// With `refill_images`, images that aren't stored yet (for example ones an
+/// older version failed to fetch) are downloaded; otherwise this works
+/// entirely offline, which keeps the editor's live preview fast.
+pub fn rebuild(library: &Library, id: &str, draft: &Draft, refill_images: bool) -> Result<Rebuilt> {
+    let mut entry = library.entry(id)?;
     let dir = library.dir(id)?;
-    let html = fs::read_to_string(dir.join("article.html")).context("this entry has no stored article HTML")?;
+    if entry.kind == EntryKind::Pdf {
+        let compiled = typeset::compile_dir(&dir)?;
+        return Ok(Rebuilt { entry, compiled });
+    }
     let base = Url::parse(&entry.final_url).or_else(|_| Url::parse(&entry.url))?;
-    let body = if settings.include_images {
-        convert_body(&entry, settings, &base, &html, &mut StoredImages::new(&entry.images))
+    let compiled = if draft.format.include_images {
+        let referer = refill_images.then(|| base.clone());
+        let mut resolver = RefillImages::new(&entry.images, &entry.rejected_images, dir.join("img"), referer);
+        let compiled = if refill_images {
+            typeset_draft(&dir, &mut entry, draft, &mut resolver, &mut |_| {})?
+        } else {
+            let mut offline = OfflineImages(&mut resolver);
+            typeset_draft(&dir, &mut entry, draft, &mut offline, &mut |_| {})?
+        };
+        let (images, rejected, still_missing) = resolver.finish();
+        entry.images = images;
+        entry.rejected_images = rejected;
+        if refill_images {
+            entry.warnings.retain(|w| !w.contains("image(s) could not be included"));
+            if still_missing > 0 {
+                entry.warnings.push(format!("{still_missing} image(s) could not be included."));
+            }
+        }
+        compiled
     } else {
-        convert_body(&entry, settings, &base, &html, &mut NoImages)
+        typeset_draft(&dir, &mut entry, draft, &mut NoImages, &mut |_| {})?
     };
-    let (compiled, density) = build(&dir, &entry, settings, &body)?;
-    entry.spread = settings.side_by_side;
-    entry.density = density;
-    write_pdf(&dir, &compiled)?;
-    entry.pages = compiled.page_count();
     library.save(&entry)?;
-    Ok(entry)
+    Ok(Rebuilt { entry, compiled })
+}
+
+/// Only stored images; never touches the network.
+struct OfflineImages<'a, 'b>(&'a mut RefillImages<'b>);
+
+impl ImageResolver for OfflineImages<'_, '_> {
+    fn resolve(&mut self, url: &Url) -> Option<crate::images::StoredImage> {
+        self.0.stored(url)
+    }
+}
+
+/// Rebuild a saved document from its draft (making one with `settings`'
+/// formatting if it has none), downloading any missing images.
+pub fn retypeset(library: &Library, id: &str, settings: &Settings) -> Result<Entry> {
+    match load_draft(library, id, &settings.format)? {
+        Some(draft) => Ok(rebuild(library, id, &draft, true)?.entry),
+        None => library.entry(id), // PDFs print as they are
+    }
+}
+
+/// Lay out `draft` into `dir`: sync the masthead into the entry, convert the
+/// included blocks, typeset (fitting spreads), write `main.typ`,
+/// `document.pdf` and `document.json`.
+fn typeset_draft(
+    dir: &Path,
+    entry: &mut Entry,
+    draft: &Draft,
+    images: &mut dyn ImageResolver,
+    progress: &mut dyn FnMut(Stage),
+) -> Result<Compiled> {
+    entry.title = if draft.meta.title.trim().is_empty() { "Untitled".into() } else { draft.meta.title.trim().to_string() };
+    entry.byline = draft.meta.byline.clone().filter(|b| !b.trim().is_empty());
+    entry.published = draft.meta.published.clone().filter(|p| !p.trim().is_empty());
+
+    let base = Url::parse(&entry.final_url).or_else(|_| Url::parse(&entry.url))?;
+    let html = draft.html();
+    let format = &draft.format;
+    let body = if format.include_images && format.grayscale_images {
+        let mut gray = GrayImages::new(images, dir.join("img"));
+        convert_body(entry, format, &base, &html, &mut gray)
+    } else {
+        convert_body(entry, format, &base, &html, images)
+    };
+
+    progress(Stage::Typesetting);
+    let (compiled, density) = build(dir, entry, format, &body, &html)?;
+    entry.spread = format.side_by_side;
+    entry.density = density;
+    entry.pages = compiled.page_count();
+    write_pdf(dir, &compiled)?;
+    fs::write(dir.join("article.txt"), convert::html_to_plain_text(&html))?;
+    draft.save(&dir.join("document.json"))?;
+    Ok(compiled)
 }
 
 /// Rasterise every page of a saved document for previewing.
@@ -391,14 +497,14 @@ pub fn delete_entry(library: &Library, id: &str) -> Result<()> {
 
 fn convert_body(
     entry: &Entry,
-    settings: &Settings,
+    format: &Format,
     base: &Url,
     html: &str,
     images: &mut dyn ImageResolver,
 ) -> String {
     let options = ConvertOptions {
-        link_style: settings.link_style,
-        include_images: settings.include_images,
+        link_style: format.link_style,
+        include_images: format.include_images,
         title: Some(entry.title.clone()),
         strip_chrome: entry.used_fallback,
     };
@@ -410,8 +516,8 @@ fn convert_body(
 /// and the spacing density used. If the rich markup fails to compile —
 /// which should not happen, but the web is endlessly creative — fall back to
 /// a plain-text rendering so the user still gets a document.
-fn build(dir: &Path, entry: &Entry, settings: &Settings, body: &str) -> Result<(Compiled, f64)> {
-    let has_qr = settings.qr_code && entry.url.len() < 1500 && {
+fn build(dir: &Path, entry: &Entry, format: &Format, body: &str, html: &str) -> Result<(Compiled, f64)> {
+    let has_qr = format.qr_code && entry.url.len() < 1500 && {
         match typeset::qr_svg(&entry.url) {
             Ok(svg) => fs::write(dir.join("qr.svg"), svg).is_ok(),
             Err(err) => {
@@ -432,16 +538,15 @@ fn build(dir: &Path, entry: &Entry, settings: &Settings, body: &str) -> Result<(
         has_qr,
     };
 
-    match typeset::compile_fitted(&meta, settings, body, dir) {
+    match typeset::compile_fitted(&meta, format, body, dir) {
         Ok(fitted) => {
             fs::write(dir.join("main.typ"), &fitted.source)?;
             Ok((fitted.compiled, fitted.density))
         }
         Err(err) => {
             log::warn!("rich typesetting failed, falling back to plain text: {err:#}");
-            fs::write(dir.join("main.rich-failed.typ"), typeset::main_source(&meta, settings, body, 0.0))?;
-            let html = fs::read_to_string(dir.join("article.html")).unwrap_or_default();
-            let plain = typeset::main_source(&meta, settings, &convert::html_to_plain_typst(&html), 0.0);
+            fs::write(dir.join("main.rich-failed.typ"), typeset::main_source(&meta, format, body, 0.0))?;
+            let plain = typeset::main_source(&meta, format, &convert::html_to_plain_typst(html), 0.0);
             fs::write(dir.join("main.typ"), &plain)?;
             let mut compiled = typeset::compile(&plain, dir).context("typesetting failed even in plain-text mode")?;
             compiled

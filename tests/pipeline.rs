@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use topebag::instapaper::{self, QueueState};
 use topebag::library::{EntryKind, Library};
 use topebag::pipeline::{self, PrintTarget, Stage};
-use topebag::settings::{BrowserMode, Paper, Settings};
+use topebag::settings::{BrowserMode, Format, Paper, Settings};
 use url::Url;
 
 const ARTICLE: &str = include_str!("fixtures/article.html");
@@ -108,7 +108,11 @@ fn serve() -> String {
 
 /// Deterministic settings: no printing, no headless browser.
 fn settings() -> Settings {
-    Settings { auto_print: false, paper: Paper::Letter, browser_mode: BrowserMode::Never, ..Settings::default() }
+    Settings {
+        format: Format { paper: Paper::Letter, ..Format::default() },
+        browser_mode: BrowserMode::Never,
+        ..Settings::default()
+    }
 }
 
 /// Can a headless browser run here? Needs Edge/Chrome, and an environment
@@ -192,9 +196,10 @@ fn url_to_pdf_to_library_and_back() {
     let previews = pipeline::render_previews(&library, &entry.id, 30.0).unwrap();
     assert_eq!(previews.len(), entry.pages);
 
-    // Re-typeset offline with different settings.
-    let a4 = Settings { paper: Paper::A4, columns: 2, include_images: false, ..settings() };
-    let updated = pipeline::retypeset(&library, &entry.id, &a4).unwrap();
+    // Re-format this document (its own format, not the defaults) offline.
+    let mut draft = pipeline::load_draft(&library, &entry.id, &settings().format).unwrap().unwrap();
+    draft.format = Format { paper: Paper::A4, columns: 2, include_images: false, ..draft.format };
+    let updated = pipeline::rebuild(&library, &entry.id, &draft, false).unwrap().entry;
     let main = std::fs::read_to_string(dir.join("main.typ")).unwrap();
     assert!(main.contains("paper: \"a4\""));
     assert!(main.contains("cols: 2"));
@@ -384,7 +389,7 @@ fn side_by_side_spreads_are_landscape_and_fitted() {
     let home = tempfile::tempdir().unwrap();
     let library = Library::open(home.path()).unwrap();
     let url = Url::parse(&format!("{base}/2026/why-print")).unwrap();
-    let spread = Settings { side_by_side: true, fit_to_sheets: true, ..settings() };
+    let spread = Settings { format: Format { side_by_side: true, fit_to_sheets: true, ..settings().format }, ..settings() };
 
     let entry = pipeline::add_url(&library, &spread, &url, None, &mut |_| {}).unwrap().entry;
     assert!(entry.spread);
@@ -395,10 +400,96 @@ fn side_by_side_spreads_are_landscape_and_fitted() {
     assert_eq!(previews.len(), entry.pages);
     assert!(previews[0].width > previews[0].height, "each sheet is landscape");
 
-    // Re-typesetting without spreads goes back to portrait pages.
-    let portrait = pipeline::retypeset(&library, &entry.id, &settings()).unwrap();
+    // Switching this document back to one page per sheet gives portrait pages.
+    let mut draft = pipeline::load_draft(&library, &entry.id, &settings().format).unwrap().unwrap();
+    assert!(draft.format.side_by_side, "the document remembers its own format");
+    draft.format.side_by_side = false;
+    let portrait = pipeline::rebuild(&library, &entry.id, &draft, false).unwrap().entry;
     assert!(!portrait.spread);
     assert_eq!(portrait.density, 0.0);
     let previews = pipeline::render_previews(&library, &entry.id, 20.0).unwrap();
     assert!(previews[0].width < previews[0].height);
+}
+
+#[test]
+fn edit_format_preview_then_print_flow() {
+    let base = serve();
+    let home = tempfile::tempdir().unwrap();
+    let library = Library::open(home.path()).unwrap();
+    let url = Url::parse(&format!("{base}/2026/why-print")).unwrap();
+
+    // Adding a link makes an editable draft and prints nothing.
+    let outcome = pipeline::add_url(&library, &settings(), &url, None, &mut |_| {}).unwrap();
+    assert!(outcome.print.is_none());
+    let id = outcome.entry.id.clone();
+    assert_eq!(library.entry(&id).unwrap().print_count(), 0);
+    let dir = library.dir(&id).unwrap();
+    assert!(dir.join("document.json").exists());
+
+    let mut draft = pipeline::load_draft(&library, &id, &settings().format).unwrap().unwrap();
+    assert!(draft.blocks.len() >= 8, "article split into blocks: {}", draft.blocks.len());
+    let find = |draft: &topebag::document::Draft, needle: &str| {
+        draft.blocks.iter().position(|b| b.preview().contains(needle)).unwrap_or_else(|| panic!("no block with {needle:?}"))
+    };
+
+    // Edit: drop the table and the duplicated byline, rewrite a heading,
+    // move the code section up, and rename the document.
+    let table = find(&draft, "Minutes read");
+    draft.blocks[table].included = false;
+    let byline = find(&draft, "By Grace Hopper");
+    draft.blocks[byline].included = false;
+    let heading = find(&draft, "A tiny bit of code");
+    draft.blocks[heading].edited = Some("Counting words, *quickly*".into());
+    draft.move_block(heading, true);
+    draft.meta.title = "Why Paper Still Wins".into();
+
+    let rebuilt = pipeline::rebuild(&library, &id, &draft, false).unwrap();
+    let main = std::fs::read_to_string(dir.join("main.typ")).unwrap();
+    assert!(!main.contains("Minutes read"), "dropped table is gone");
+    assert!(!main.contains("By Grace Hopper\n"), "dropped byline paragraph is gone");
+    assert!(main.contains("Counting words, #emph[quickly]"), "edited heading is typeset:\n{main}");
+    assert!(main.contains("title: \"Why Paper Still Wins\""));
+    assert_eq!(rebuilt.entry.title, "Why Paper Still Wins", "library shows the new title");
+    assert_eq!(rebuilt.compiled.page_count(), rebuilt.entry.pages);
+    let text = std::fs::read_to_string(dir.join("article.txt")).unwrap();
+    assert!(text.contains("Counting words") && !text.contains("Minutes read"), "search sees the edited text");
+
+    // The draft survives a reload.
+    let reloaded = pipeline::load_draft(&library, &id, &settings().format).unwrap().unwrap();
+    assert_eq!(reloaded, draft);
+
+    // Missing images: offline rebuilds skip them; refilling downloads them.
+    let mut entry = library.entry(&id).unwrap();
+    entry.images.clear();
+    library.save(&entry).unwrap();
+    std::fs::remove_dir_all(dir.join("img")).unwrap();
+    let offline = pipeline::rebuild(&library, &id, &draft, false).unwrap();
+    assert!(offline.entry.images.is_empty());
+    assert!(!std::fs::read_to_string(dir.join("main.typ")).unwrap().contains("#tb-figure("));
+    let refilled = pipeline::rebuild(&library, &id, &draft, true).unwrap();
+    assert_eq!(refilled.entry.images.len(), 1, "missing image fetched again");
+    assert!(std::fs::read_to_string(dir.join("main.typ")).unwrap().contains("#tb-figure("));
+
+    // Grayscale is per document and doesn't re-download.
+    draft.format.grayscale_images = true;
+    pipeline::rebuild(&library, &id, &draft, false).unwrap();
+    assert!(std::fs::read_to_string(dir.join("main.typ")).unwrap().contains("/img/gray-"));
+
+    // Restore original brings everything back (formatting is kept).
+    draft.restore_original(&pipeline::original_html(&library, &id).unwrap());
+    let restored = pipeline::rebuild(&library, &id, &draft, false).unwrap();
+    let main = std::fs::read_to_string(dir.join("main.typ")).unwrap();
+    assert!(main.contains("Minutes read") && main.contains("A tiny bit of code"));
+    assert_eq!(restored.entry.title, "Why We Still Print Things");
+    assert!(draft.format.grayscale_images);
+}
+
+#[test]
+fn pdfs_have_no_draft() {
+    let base = serve();
+    let home = tempfile::tempdir().unwrap();
+    let library = Library::open(home.path()).unwrap();
+    let url = Url::parse(&format!("{base}/paper.pdf")).unwrap();
+    let id = pipeline::add_url(&library, &settings(), &url, None, &mut |_| {}).unwrap().entry.id;
+    assert!(pipeline::load_draft(&library, &id, &settings().format).unwrap().is_none());
 }

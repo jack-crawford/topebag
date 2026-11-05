@@ -1,9 +1,12 @@
 # Topebag
 
 **Links in, paper out.** Paste a link to an article or a PDF. Topebag strips
-away the navigation, ads and cookie banners, typesets the content as a
-clean, print-friendly PDF, sends it straight to your printer, and keeps a
-copy in its library. It can also print your **Instapaper queue**.
+away the navigation, ads and cookie banners and typesets the content as a
+clean, print-friendly document. You **edit** it (drop blocks, fix the title,
+rewrite a paragraph), **format** it (paper, type size, two pages per
+sheet…), check the **live preview**, and **print** when it looks right.
+Every document stays in a local library. It can also bring in your
+**Instapaper queue**.
 
 Topebag is a native desktop app written in Rust. Everything runs locally: no
 cloud service, and no PDF reader is required to print.
@@ -16,8 +19,18 @@ cloud service, and no PDF reader is required to print.
 
 ## Features
 
-- **Paste and print.** Paste one link or a whole list (Ctrl+V works anywhere
-  in the window). Each link is fetched, cleaned and printed in the background.
+- **Link → edit → format → preview → print.** Paste one link or a whole list
+  (Ctrl+V works anywhere in the window). Each link is fetched and cleaned in
+  the background and opens as a document you can trim and format with a live
+  preview. Nothing is printed until you click **Print**.
+- **Edit by blocks.** The article is shown as blocks (headings, paragraphs,
+  images, quotes, lists, code, tables). Untick a block to drop it, move it up
+  or down, or rewrite its text in light Markdown (bold, italics and links are
+  kept). Title, byline and date are editable. *Restore original* undoes it
+  all.
+- **Format each document.** Paper, typeface, text size, columns, two pages
+  per sheet, images (or grayscale images), link footnotes and the QR code are
+  set per document. Settings holds the defaults for new ones.
 - **Reader-mode extraction.** Uses a Rust port of Mozilla Readability (the
   engine behind Firefox Reader View) to find the actual article. Pages that
   aren't articles fall back to a cleaned-up copy of the whole page.
@@ -30,8 +43,8 @@ cloud service, and no PDF reader is required to print.
   profile. Sites you list are then fetched with your subscription. Your
   everyday browser's passwords and cookies are never read.
 - **Your Instapaper queue.** Connect the private RSS feed of your Instapaper
-  Unread folder to see unprinted saves and print them in one click, or have
-  new saves printed automatically.
+  Unread folder to bring saves into your library in one click (or
+  automatically), ready to edit and print.
 - **Typeset like a book.** The embedded [Typst](https://typst.app) compiler
   lays out the pages: justified text with hyphenation, smart quotes, headings,
   lists, tables, highlighted code, quotes, and captioned figures that float to
@@ -47,17 +60,16 @@ cloud service, and no PDF reader is required to print.
 - **Direct printing.** Topebag prints through the standard Windows print
   system, so any installed printer works. You choose the printer, copies and
   quality.
-- **A library.** Every document is saved with its PDF, images and metadata.
-  **Tag** documents, **search their full text**, rename them, preview,
-  reprint, or **re-typeset** with new settings (paper, font, columns) without
-  downloading again.
+- **A library.** Every document is saved with its PDF, images, edits and
+  formatting. **Tag** documents, **search their full text**, reopen and
+  re-edit any of them (missing images are fetched again), and reprint.
 - **Lives in the tray.** Closing the window keeps Topebag running in the
   system tray (to accept links and watch Instapaper). It can start with
   Windows, and launching it again just brings the window back.
 - **Fully local and inspectable.** Each document is a plain folder on disk,
   with no database to break.
-- **A CLI as well.** `topebag add <url>`, `topebag instapaper --print-all`,
-  `topebag search …` and more.
+- **A CLI as well.** `topebag add <url> [--print]`, `topebag instapaper
+  --fetch-all`, `topebag search …` and more.
 
 ## Quick start (Windows)
 
@@ -89,25 +101,39 @@ the template are compiled in.
 
 ## Using Topebag
 
-1. **Copy a link** from your browser.
-2. **Press Ctrl+V** anywhere in the Topebag window, or paste into the bar at
-   the top. Paste several links at once to queue them all.
-3. The **Activity** panel shows progress: downloading, loading in the browser
-   if needed, finding the article, fetching images, typesetting, printing.
-4. The document appears in the **Library** with a live page preview.
+1. **Paste a link.** Copy it from your browser and press **Ctrl+V** anywhere
+   in the Topebag window (or paste into the bar and press **Enter**). Paste
+   several links to queue them. The **Activity** panel shows progress.
+2. **Edit.** The document opens with its **Edit** tab: fix the title, byline
+   or date, untick blocks you don't want on paper (ads that slipped through,
+   "subscribe" boxes, author bios, a huge table), move blocks with **↑ ↓**,
+   and click **✎** to rewrite a block's text. *Restore original* brings
+   everything back.
+3. **Format.** In the **Format** tab, choose paper, typeface, text size,
+   columns, **two pages side by side** (with spacing fitted to the fewest
+   sheets), images, link footnotes and the QR code. These apply to this
+   document only; *Use as default for new documents* saves them as the
+   defaults.
+4. **Preview.** The preview on the right updates about half a second after
+   each change and shows the page or sheet count.
+5. **Print.** Pick the printer and copies under the preview and click
+   **🖨 Print** (or press **Ctrl+P**).
+
+Any saved document can be reopened from the library and edited again. Its
+edits and formatting are remembered.
 
 | Control | What it does |
 |---|---|
-| **Print automatically** | When on, new documents are printed as soon as they're typeset. When off, they're only saved. |
-| **▮ One page / ▮▮ Side by side** | Switch new documents between normal pages and two-pages-per-sheet spreads. |
-| **Printer menu** | Pick a printer, or "System default". Use *Refresh list* after adding a printer. |
-| **Instapaper** | Your Instapaper queue (the button shows how many saves are unprinted). |
-| **Print** (Ctrl+P) | Print the selected document again. |
-| **✎** next to the title | Rename the document. |
-| **+ add tag** | Tag the document (comma-separate several). Click a tag to remove it. |
+| **Fetch** | Fetch the pasted link(s) into the library. |
+| **Instapaper** | Your Instapaper queue (the button shows how many saves are waiting). |
+| **✎ Edit / Aa Format** | The document's editing and formatting tabs. |
+| **☑ ↑ ↓ ✎** on a block | Print or drop the block, move it, rewrite its text. |
+| **Restore original** | Undo all edits (formatting is kept). |
+| **Fetch missing images** | Shown when some images couldn't be downloaded: try again. |
+| **🖨 Print** (Ctrl+P), **×copies**, **printer menu** | Print the document. |
+| **+ tag** | Tag the document (comma-separate several). Click a tag to remove it. |
 | **Open PDF / Show in folder** | Open the saved PDF in your viewer, or reveal it in Explorer. |
-| **Re-typeset** | Rebuild the selected article with your *current* settings. |
-| **Settings** (Ctrl+,) | Everything below. |
+| **Settings** (Ctrl+,) | Defaults and preferences, described below. |
 
 ### Searching the library
 
@@ -121,19 +147,20 @@ every saved article, and shows a snippet of where the words were found.
 | `tag:long-reads` | documents tagged *long reads* (the tag chips under the search box do the same) |
 | `rust -async` | documents with *rust* but not *async* |
 
-### Printing your Instapaper queue
+### Bringing in your Instapaper queue
 
 1. On instapaper.com, open **Unread**, open the **Downloads** menu (top
    right), and copy the **RSS Feed** link.
 2. In Topebag, click **Instapaper**, paste the link and click **Connect**.
-3. Your unprinted saves are listed. Tick the ones you want and click
-   **Fetch & print**, or **Skip** them.
-4. Optionally turn on **Print new saves automatically**. Topebag checks every
+3. Your waiting saves are listed. Tick the ones you want and click
+   **Fetch** to bring them into your library, ready to edit and print, or
+   **Skip** them.
+4. Optionally turn on **Fetch new saves automatically**. Topebag checks every
    15 minutes (configurable) while it's running, including from the tray.
-   Only articles saved *after* you turn this on are printed automatically, so
-   a big backlog never floods your printer.
+   Only articles saved *after* you turn this on are fetched automatically,
+   and nothing is ever printed without you.
 
-Printed and skipped items never come back. No password or API key is
+Fetched and skipped items never come back. No password or API key is
 involved, but the feed link is a secret, so keep it private. Any RSS or Atom
 feed works the same way.
 
@@ -151,8 +178,9 @@ site and opens the sign-in window.
 
 ### Side-by-side spreads
 
-Turn on **▮▮ Side by side** in the toolbar (or *Settings → Page layout →
-Spread*). Each landscape sheet then holds two half-size pages: the masthead
+Tick **Two pages side by side on each sheet** in a document's **Format** tab
+(or in *Settings → Defaults for new documents*). Each landscape sheet then
+holds two half-size pages: the masthead
 starts the left page, text flows down the left page and continues on the
 right, each half has its own page number, and a small mark shows the fold.
 
@@ -173,14 +201,13 @@ side (spacing tightened 81%)".
 As spacing tightens, paragraphs switch from blank-line gaps to book-style
 first-line indents, and figures and margins shrink with the text. Printing
 turns each landscape sheet a quarter turn automatically, so it fills portrait
-paper. To convert a saved article, select it and click **Re-typeset** (or
-`topebag retypeset --side-by-side <id>`).
+paper. To convert a saved article, open it and tick the option in its Format
+tab (or run `topebag retypeset --side-by-side <id>`).
 
 ### Settings
 
 | Setting | Default | Notes |
 |---|---|---|
-| Print automatically | on | |
 | Copies | 1 | |
 | Quality | Standard (300 dpi) | High (600 dpi) gives crisper text on laser printers and uses about 4× the memory per page. |
 | Paper | from your Windows region | US Letter, A4, US Legal, A5 |
@@ -195,11 +222,13 @@ paper. To convert a saved article, select it and click **Re-typeset** (or
 | QR code | on | Links back to the original page. |
 | Use the browser | Automatic | *Always* loads every page in Edge (slower). *Never* disables it. |
 | Sites you've signed in to | — | Always loaded with Topebag's browser profile. |
-| Instapaper feed / print automatically / interval | — / off / 15 min | |
+| Instapaper feed / fetch automatically / interval | — / off / 15 min | Fetched saves wait in the library; they're never printed by themselves. |
 | Keep running in the tray | on | Closing the window hides Topebag. Quit from the tray menu. |
 | Start with Windows | off | Adds Topebag to your per-user startup list (Task Manager → Startup apps). |
 
-Settings are stored in `settings.json` in the data folder (see below).
+Paper through QR code are the **defaults for new documents**; each document
+keeps its own copy, changed in its Format tab. Settings are stored in
+`settings.json` in the data folder (see below).
 
 ### The tray icon
 
@@ -213,21 +242,21 @@ Instapaper now*, *Quit Topebag*. Starting Topebag again (or running
 The same executable has a CLI. Run `topebag --help` for details.
 
 ```bash
-topebag add https://example.com/article            # fetch, save, and print (if auto-print is on)
+topebag add https://example.com/article            # fetch into the library (ready to edit in the app)
 topebag add https://example.com/report.pdf         # PDFs work too
-topebag add --no-print URL1 URL2                   # just save
+topebag add --print URL1 URL2                      # fetch and print straight away
 topebag add --side-by-side URL                     # two pages per sheet, fitted to the fewest sheets
-topebag add URL --printer "Brother HL-L2305 series Printer"
+topebag add URL --printer "Brother HL-L2305 series Printer"   # implies --print
 topebag add URL --print-to-file out.pdf            # paper-free test via "Microsoft Print to PDF"
 topebag list                                       # library, newest first
 topebag search "gutenberg press" tag:history       # full-text search
 topebag tag <id> +reading -todo                    # add/remove tags
 topebag print <id>                                 # reprint a saved document
-topebag retypeset <id>                             # rebuild with current settings
-topebag retypeset --side-by-side <id>              # convert a saved article to spreads
+topebag retypeset <id>                             # rebuild from its edits and format (fetches missing images)
+topebag retypeset --side-by-side <id>              # switch a document to spreads (--one-page to undo)
 topebag instapaper --feed <RSS URL>                # connect Instapaper
-topebag instapaper                                 # list unprinted saves
-topebag instapaper --print-all                     # fetch and print them
+topebag instapaper                                 # list waiting saves
+topebag instapaper --fetch-all [--print]           # fetch them (and optionally print)
 topebag instapaper --skip-all                      # mark them all as handled
 topebag sign-in https://www.nytimes.com/           # sign in to a site in Topebag's browser
 topebag printers                                   # installed printers
@@ -246,7 +275,8 @@ topebag gui [--background] [URL…]                  # open the app (or hand lin
   library\
     2026-11-05_143012_the-quiet-joy-of-paper\
       entry.json      title, URL, dates, tags, print history, image list
-      article.html    the cleaned article (kept for re-typesetting)
+      document.json   your edits: blocks (kept/dropped/moved/rewritten), masthead, format
+      article.html    the cleaned original article (for "Restore original")
       article.txt     plain text (for full-text search)
       main.typ        the generated Typst source
       img\…           downloaded images, normalised for print
@@ -283,6 +313,7 @@ design decisions and how to extend Topebag. The API docs build with
 | "The browser returned an empty page — is the sign-in window still open?" | Close the Topebag sign-in browser window. Edge can't use a profile that's already open. |
 | A page still comes out nearly empty | Check that **Use the browser** isn't *Never* and that Edge is installed. Some sites block automated browsers too. |
 | A paywalled article is cut off | Add the site under *Sites you've signed in to* and sign in with **Open sign-in browser…**. |
+| A document's preview says "Updating…" and Print is disabled | Topebag is rebuilding after your last change; Print turns back on when the preview is current. |
 | Closing the window doesn't quit | That's *Keep running in the tray*. Quit from the tray icon's menu, or turn the setting off. |
 | Instapaper says "not its RSS feed" | Copy the **RSS Feed** link from the Downloads menu, not the page address. |
 
@@ -295,10 +326,11 @@ src/
   browser.rs      headless Edge/Chrome and the sign-in profile
   extract.rs      Readability extraction and metadata
   images.rs       image download, normalisation and caching
+  document.rs     editable drafts: blocks, Markdown edits, per-document format
   convert.rs      HTML → Typst markup (escaping, structure)
   typeset.rs      embedded Typst compiler, fonts, PDF/raster output, PDF wrapper
   library.rs      on-disk library (entries, tags, plain text)
-  pipeline.rs     add / print / re-typeset / preview workflows
+  pipeline.rs     add / load_draft / rebuild / print / preview workflows
   instapaper.rs   reading-queue feeds and their state
   search.rs       full-text search and query syntax
   instance.rs     single running instance and hand-off
@@ -306,7 +338,7 @@ src/
   settings.rs     preferences
   print/          Windows GDI printing; CUPS on macOS/Linux
   main.rs, cli.rs executable entry point and CLI
-  gui/            egui desktop app (window, worker threads, tray, theme)
+  gui/            egui desktop app (editor, live preview, worker threads, tray, theme)
 assets/topebag.typ   the document template (all typography lives here)
 tests/               end-to-end tests with a local HTTP server
 examples/            render_pages: export an entry's pages as PNGs
@@ -316,7 +348,8 @@ examples/            render_pages: export an entry's pages as PNGs
 
 Done: articles, PDF links, JavaScript pages, sign-in sites, the Instapaper
 queue, tags, full-text search, tray icon, start with Windows, side-by-side
-spreads fitted to the fewest sheets.
+spreads fitted to the fewest sheets, and the edit → format → preview → print
+workflow.
 
 Possible next steps:
 

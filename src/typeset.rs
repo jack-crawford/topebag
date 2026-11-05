@@ -39,7 +39,7 @@ use typst::{Library, LibraryExt, World, WorldExt};
 use typst_layout::PagedDocument;
 
 use crate::convert::{breakable_url, string_literal};
-use crate::settings::{Settings, Typeface};
+use crate::settings::{Format, Typeface};
 
 /// The document template, compiled into the binary.
 pub const TEMPLATE: &str = include_str!("../assets/topebag.typ");
@@ -63,7 +63,7 @@ pub struct DocMeta {
 /// Build the complete `main.typ` for an article.
 ///
 /// `density` (0–1) tightens spacing; see [`compile_fitted`].
-pub fn main_source(meta: &DocMeta, settings: &Settings, body: &str, density: f64) -> String {
+pub fn main_source(meta: &DocMeta, format: &Format, body: &str, density: f64) -> String {
     let opt = |v: &Option<String>| v.as_deref().map(string_literal).unwrap_or_else(|| "none".into());
 
     let mut meta_line = Vec::new();
@@ -134,16 +134,16 @@ pub fn main_source(meta: &DocMeta, settings: &Settings, body: &str, density: f64
         saved = opt(&meta.saved),
         lang = string_literal(&lang),
         region = region.as_deref().map(string_literal).unwrap_or_else(|| "none".into()),
-        paper = string_literal(settings.paper.typst_name()),
-        font_size = settings.font_size,
-        typeface = string_literal(match settings.typeface {
+        paper = string_literal(format.paper.typst_name()),
+        font_size = format.font_size,
+        typeface = string_literal(match format.typeface {
             Typeface::Serif => "serif",
             Typeface::Sans => "sans",
         }),
-        cols = settings.columns.clamp(1, 2),
-        justify = settings.justify,
+        cols = format.columns.clamp(1, 2),
+        justify = format.justify,
         qr = if meta.has_qr { "\"/qr.svg\"" } else { "none" },
-        spread = settings.side_by_side,
+        spread = format.side_by_side,
         density = density.clamp(0.0, 1.0),
     )
 }
@@ -246,7 +246,7 @@ const FIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// Lay out an article.
 ///
-/// With side-by-side spreads and [`Settings::fit_to_sheets`], this finds the
+/// With side-by-side spreads and [`Format::fit_to_sheets`], this finds the
 /// *least* tightening that still yields the *fewest* sheets:
 ///
 /// 1. lay out at density 0 (normal spacing) and at density 1 (most compact:
@@ -256,15 +256,15 @@ const FIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
 ///
 /// So a 3-sheet article that can squeeze onto 2 sheets is tightened just
 /// enough, while one that saves nothing keeps its normal spacing.
-pub fn compile_fitted(meta: &DocMeta, settings: &Settings, body: &str, root: &Path) -> Result<Fitted> {
+pub fn compile_fitted(meta: &DocMeta, format: &Format, body: &str, root: &Path) -> Result<Fitted> {
     let attempt = |density: f64| -> Result<Fitted> {
-        let source = main_source(meta, settings, body, density);
+        let source = main_source(meta, format, body, density);
         let compiled = compile(&source, root)?;
         Ok(Fitted { compiled, source, density })
     };
 
     let relaxed = attempt(0.0)?;
-    if !(settings.side_by_side && settings.fit_to_sheets) || relaxed.compiled.page_count() <= 1 {
+    if !(format.side_by_side && format.fit_to_sheets) || relaxed.compiled.page_count() <= 1 {
         return Ok(relaxed);
     }
     let started = std::time::Instant::now();
@@ -610,7 +610,7 @@ mod tests {
             saved: Some("5 November 2026".into()),
             ..Default::default()
         };
-        main_source(&meta, &Settings::default(), body, 0.0)
+        main_source(&meta, &Format::default(), body, 0.0)
     }
 
     #[test]
@@ -685,7 +685,7 @@ mod tests {
     #[test]
     fn side_by_side_sheets_are_landscape() {
         let dir = tempfile::tempdir().unwrap();
-        let settings = Settings { side_by_side: true, ..Settings::default() };
+        let settings = Format { side_by_side: true, ..Format::default() };
         let compiled = compile(&main_source(&spread_meta(), &settings, &long_body(3), 0.0), dir.path()).unwrap();
         let (w, h) = page_size_pt(&compiled.document, 0).unwrap();
         assert!(w > h, "landscape sheet expected, got {w}x{h}");
@@ -694,7 +694,7 @@ mod tests {
     #[test]
     fn fitting_uses_the_fewest_sheets_with_the_least_tightening() {
         let dir = tempfile::tempdir().unwrap();
-        let settings = Settings { side_by_side: true, fit_to_sheets: true, ..Settings::default() };
+        let settings = Format { side_by_side: true, fit_to_sheets: true, ..Format::default() };
         let meta = spread_meta();
         let sheets_at = |paragraphs: usize, density: f64| {
             compile(&main_source(&meta, &settings, &long_body(paragraphs), density), dir.path()).unwrap().page_count()
@@ -718,7 +718,7 @@ mod tests {
         assert_eq!(short.density, 0.0);
 
         // Fitting is off when not side by side.
-        let normal = Settings { side_by_side: false, ..settings.clone() };
+        let normal = Format { side_by_side: false, ..settings.clone() };
         assert_eq!(compile_fitted(&meta, &normal, &long_body(paragraphs), dir.path()).unwrap().density, 0.0);
     }
 

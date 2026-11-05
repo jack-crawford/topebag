@@ -42,15 +42,15 @@ pub enum Mode {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Fetch URLs, save them as PDFs in the library, and print them.
+    /// Fetch URLs into the library as ready-to-print documents.
     Add {
         /// One or more web addresses.
         #[arg(required = true)]
         urls: Vec<String>,
-        /// Save to the library without printing.
+        /// Also print each document once it's ready.
         #[arg(long)]
-        no_print: bool,
-        /// Printer to use (defaults to the one in settings, then the system default).
+        print: bool,
+        /// Printer to use (implies --print; defaults to settings, then the system default).
         #[arg(long)]
         printer: Option<String>,
         /// Print to a file instead of paper (uses "Microsoft Print to PDF" on Windows).
@@ -69,13 +69,17 @@ pub enum Command {
         #[arg(long, value_name = "FILE")]
         print_to_file: Option<PathBuf>,
     },
-    /// Rebuild a saved document with the current settings.
+    /// Rebuild a saved document from its draft (edits and formatting),
+    /// downloading any images that were missing.
     Retypeset {
         /// Entry id (see `topebag list`).
         id: String,
-        /// Lay out two pages side by side on each sheet (overrides settings).
-        #[arg(long)]
+        /// Switch this document to two pages side by side on each sheet.
+        #[arg(long, conflicts_with = "one_page")]
         side_by_side: bool,
+        /// Switch this document back to one page per sheet.
+        #[arg(long)]
+        one_page: bool,
     },
     /// List saved documents, newest first.
     List,
@@ -83,19 +87,19 @@ pub enum Command {
     Printers,
     /// Show the data folder and current settings.
     Info,
-    /// Show your Instapaper queue (unread saves not printed yet), or print it.
+    /// Show your Instapaper queue (unread saves not fetched yet), or fetch it.
     Instapaper {
         /// Save your private feed URL (instapaper.com → Unread → Downloads menu → RSS Feed).
         #[arg(long, value_name = "URL")]
         feed: Option<String>,
-        /// Fetch every unprinted item (and print it, unless --no-print).
+        /// Fetch every new item into the library.
         #[arg(long)]
-        print_all: bool,
-        /// With --print-all: save to the library without printing.
+        fetch_all: bool,
+        /// With --fetch-all: also print each document.
         #[arg(long)]
-        no_print: bool,
-        /// Mark every item as handled without printing it.
-        #[arg(long, conflicts_with = "print_all")]
+        print: bool,
+        /// Mark every item as handled without fetching it.
+        #[arg(long, conflicts_with = "fetch_all")]
         skip_all: bool,
     },
     /// Add or remove tags, e.g. `topebag tag <id> +reading -todo`.
@@ -154,11 +158,11 @@ fn execute(command: Command) -> Result<()> {
     let settings = Settings::load(&library::settings_path(&data_dir))?;
 
     match command {
-        Command::Add { urls, no_print, printer, print_to_file, side_by_side } => {
+        Command::Add { urls, print, printer, print_to_file, side_by_side } => {
             let mut settings = settings;
-            settings.side_by_side |= side_by_side;
+            settings.format.side_by_side |= side_by_side;
             let target = print_target(printer, print_to_file)?;
-            let print_requested = !no_print && (settings.auto_print || target.output_file.is_some() || target.printer.is_some());
+            let print_requested = print || target.output_file.is_some() || target.printer.is_some();
             let mut failures = 0;
             for raw in &urls {
                 let url = match fetch::parse_url(raw) {
@@ -208,10 +212,16 @@ fn execute(command: Command) -> Result<()> {
             let rec = pipeline::print_entry(&library, &id, &settings, &target)?;
             println!("printed {} sheet(s) on {}", rec.pages, rec.printer);
         }
-        Command::Retypeset { id, side_by_side } => {
-            let mut settings = settings;
-            settings.side_by_side |= side_by_side;
-            let entry = pipeline::retypeset(&library, &id, &settings)?;
+        Command::Retypeset { id, side_by_side, one_page } => {
+            let entry = match pipeline::load_draft(&library, &id, &settings.format)? {
+                Some(mut draft) => {
+                    if side_by_side || one_page {
+                        draft.format.side_by_side = side_by_side;
+                    }
+                    pipeline::rebuild(&library, &id, &draft, true)?.entry
+                }
+                None => library.entry(&id)?, // PDFs print as they are
+            };
             if entry.spread {
                 println!(
                     "re-typeset \"{}\" — {} sheet(s) side by side, spacing tightened {:.0}%",
@@ -253,7 +263,7 @@ fn execute(command: Command) -> Result<()> {
             println!("Settings:    {}", library::settings_path(&data_dir).display());
             println!("{}", serde_json::to_string_pretty(&settings)?);
         }
-        Command::Instapaper { feed, print_all, no_print, skip_all } => {
+        Command::Instapaper { feed, fetch_all, print, skip_all } => {
             let mut settings = settings;
             if let Some(feed) = feed {
                 let url = instapaper::parse_feed_url(&feed)?;
@@ -277,9 +287,9 @@ fn execute(command: Command) -> Result<()> {
             } else if skip_all {
                 state.mark_seen(queue.iter().map(|i| i.id.as_str()));
                 println!("Marked {} item(s) as handled.", queue.len());
-            } else if print_all {
+            } else if fetch_all {
                 let target = PrintTarget::default();
-                let print = !no_print && settings.auto_print;
+                let print = print;
                 for item in &queue {
                     println!("→ {}", item.title);
                     let url = fetch::parse_url(&item.url)?;
@@ -302,7 +312,7 @@ fn execute(command: Command) -> Result<()> {
                 for item in &queue {
                     println!("  • {}\n    {}", item.title, item.url);
                 }
-                println!("\nPrint them with: topebag instapaper --print-all");
+                println!("\nFetch them with: topebag instapaper --fetch-all   (add --print to print too)");
             }
             state.save(&state_path)?;
         }
