@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en-US">
+<head>
+  <meta charset="utf-8">
+  <title>Why We Still Print Things | The Example Review</title>
+  <meta property="og:site_name" content="The Example Review">
+  <meta property="og:title" content="Why We Still Print Things">
+  <meta name="author" content="Grace Hopper">
+  <meta property="article:published_time" content="2026-10-28T08:30:00Z">
+  <style>body { font-family: sans-serif } .ad { background: yellow }</style>
+  <script>window.tracking = { id: 42 };</script>
+</head>
+<body>
+  <header class="site-header">
+    <a href="/" class="logo">The Example Review</a>
+    <nav><a href="/news">News</a> <a href="/culture">Culture</a> <a href="/subscribe">Subscribe</a></nav>
+  </header>
+  <div class="cookie-banner">We use cookies. <button>Accept all</button></div>
+
+  <main>
+    <article>
+      <h1>Why We Still Print Things</h1>
+      <p class="byline">By <a href="/authors/grace" rel="author">Grace Hopper</a></p>
+
+      <p>There is a particular kind of attention that only paper seems to summon. A
+      printed page does not refresh, notify, autoplay or suggest. It just sits there,
+      patiently, waiting to be read from the first line to the last. In an age of
+      infinite scroll, that patience has become a feature rather than a limitation.</p>
+
+      <p>Researchers have long argued about whether reading on paper improves
+      comprehension. The evidence is <em>mixed</em>, but one finding keeps returning:
+      people who read long, <strong>complex texts</strong> on paper tend to remember
+      the structure of an argument better. See the <a href="https://example.org/study?id=7&amp;ref=print">2024 meta-study</a> for details.</p>
+
+      <figure>
+        <img src="/images/press.png" alt="An old printing press" width="1200" height="600">
+        <figcaption>A printing press, photographed in <em>1953</em>.</figcaption>
+      </figure>
+
+      <h2>What makes a page print-friendly</h2>
+      <p>Good print layouts share a handful of properties:</p>
+      <ul>
+        <li>Generous margins and a comfortable measure of 60–75 characters.</li>
+        <li>Real typography: proper quotes, dashes, ligatures and hyphenation.</li>
+        <li>No navigation, no ads, and no "related stories" carousel.
+          <ol>
+            <li>Especially no carousels.</li>
+            <li>Really.</li>
+          </ol>
+        </li>
+      </ul>
+
+      <blockquote><p>"The best interface is no interface." — someone who owned a printer</p></blockquote>
+
+      <h2>A tiny bit of code</h2>
+      <p>Here is how you might count words in Rust, using <code>split_whitespace</code>:</p>
+<pre><code class="language-rust">fn word_count(text: &amp;str) -&gt; usize {
+    text.split_whitespace().count() // #hash, *stars*, $dollars$
+}</code></pre>
+
+      <h2>The numbers</h2>
+      <table>
+        <thead><tr><th>Medium</th><th>Minutes read</th><th>Recall</th></tr></thead>
+        <tbody>
+          <tr><td>Paper</td><td>18</td><td>72%</td></tr>
+          <tr><td>Screen</td><td>11</td><td>58%</td></tr>
+          <tr><td colspan="2">Average</td><td>65%</td></tr>
+        </tbody>
+      </table>
+
+      <p>Special characters must survive the trip: 1. this is not a list, # nor a
+      heading, = nor this, [brackets], _underscores_, back\slashes, @mentions,
+      &lt;angle brackets&gt;, 50% off, AT&amp;T, naïve café, Ελληνικά, 日本語, and emoji 📄.</p>
+
+      <p>In the end, printing an article is a small act of commitment. You decide
+      that this, out of everything competing for your attention today, deserves a
+      quiet half hour. That alone might be the best argument for paper.</p>
+    </article>
+
+    <aside class="related">
+      <h3>Related stories</h3>
+      <ul><li><a href="/x">Ten printers ranked</a></li><li><a href="/y">Is paper dead?</a></li></ul>
+    </aside>
+    <div class="ad">BUY NOW — 50% OFF EVERYTHING</div>
+  </main>
+
+  <footer>© 2026 The Example Review · <a href="/privacy">Privacy</a></footer>
+</body>
+</html>

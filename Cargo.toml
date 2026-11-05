@@ -1,0 +1,59 @@
+[package]
+name = "topebag"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Paste a URL, get a cleanly typeset, print-ready PDF sent straight to your printer."
+license = "MIT"
+readme = "README.md"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+directories = "6"
+dom_smoothie = "0.19"
+ego-tree = "0.11"
+encoding_rs = "0.8"
+hayro-syntax = "0.7"
+eframe = { version = "0.37", default-features = false, features = ["accesskit", "clipboard", "default_fonts", "glow", "links", "wayland", "x11"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+log = "0.4"
+env_logger = "0.11"
+opener = { version = "0.9", features = ["reveal"] }
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
+arboard = { version = "3", default-features = false }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "native-tls", "gzip", "brotli", "deflate", "charset", "http2"] }
+roxmltree = "0.21"
+scraper = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+typst = "0.15"
+typst-pdf = "0.15"
+typst-render = "0.15"
+typst-layout = "0.15"
+typst-assets = { version = "0.15", features = ["fonts"] }
+url = "2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Printing",
+    "Win32_Storage_Xps",
+    "Win32_Globalization",
+    "Win32_System_Console",
+    "Win32_System_Registry",
+] }
+tray-icon = "0.26"
+
+# Typst layout and egui are slow without optimisation, so dependencies are
+# always optimised, even in dev builds. Our own crate stays quick to compile.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
