@@ -493,3 +493,92 @@ fn pdfs_have_no_draft() {
     let id = pipeline::add_url(&library, &settings(), &url, None, &mut |_| {}).unwrap().entry.id;
     assert!(pipeline::load_draft(&library, &id, &settings().format).unwrap().is_none());
 }
+
+#[test]
+fn articles_combine_into_a_newspaper_edition() {
+    use topebag::edition;
+
+    let base = serve();
+    let home = tempfile::tempdir().unwrap();
+    let library = Library::open(home.path()).unwrap();
+    let url = Url::parse(&format!("{base}/2026/why-print")).unwrap();
+
+    // Three articles, each retitled like a reader might, printed separately.
+    let mut ids = Vec::new();
+    let mut separate_pages = 0;
+    for n in 1..=3 {
+        let id = pipeline::add_url(&library, &settings(), &url, None, &mut |_| {}).unwrap().entry.id;
+        let mut draft = pipeline::load_draft(&library, &id, &settings().format).unwrap().unwrap();
+        draft.meta.title = format!("Story number {n}");
+        separate_pages += pipeline::rebuild(&library, &id, &draft, false).unwrap().entry.pages;
+        ids.push(id);
+    }
+    // A PDF can't flow into columns, so it's left out.
+    let pdf_url = Url::parse(&format!("{base}/paper.pdf")).unwrap();
+    let pdf = pipeline::add_url(&library, &settings(), &pdf_url, None, &mut |_| {}).unwrap().entry.id;
+    let picked = vec![ids[0].clone(), pdf.clone(), ids[1].clone(), ids[2].clone()];
+
+    let rebuilt = edition::create(&library, edition::new_from_settings(&picked, &settings())).unwrap();
+    let entry = &rebuilt.entry;
+    let id = entry.id.clone();
+    assert_eq!(entry.kind, EntryKind::Edition);
+    assert!(entry.url.is_empty());
+    assert_eq!(entry.pages, rebuilt.compiled.page_count());
+    assert!(
+        entry.pages < separate_pages,
+        "stories share pages instead of each ending on its own: {} pages vs {separate_pages} printed separately",
+        entry.pages
+    );
+    assert_eq!(entry.print_count(), 0, "nothing prints by itself");
+
+    let dir = library.dir(&id).unwrap();
+    let main = std::fs::read_to_string(dir.join("main.typ")).unwrap();
+    assert_eq!(main.matches("#tb-story(").count(), 3, "the PDF was skipped:\n{main}");
+    let at = |needle: &str| main.find(needle).unwrap_or_else(|| panic!("{needle:?} missing"));
+    assert!(at("Story number 1") < at("Story number 2") && at("Story number 2") < at("Story number 3"), "picked order");
+    assert!(!main.contains("float: true"), "pictures stay inside their own story");
+    assert!(main.contains("cols: 3"));
+
+    // Each story's images are copied in, so the edition outlives its articles.
+    assert!(main.contains("\"/img/1-") && main.contains("\"/img/3-"), "story images:\n{main}");
+    assert_eq!(std::fs::read_dir(dir.join("img")).unwrap().count(), 3);
+
+    // Saved model, search text, and preview/print from what's on disk.
+    let mut ed = edition::load(&library, &id).unwrap();
+    assert_eq!(ed.members.iter().map(|m| m.id.clone()).collect::<Vec<_>>(), ids);
+    assert!(library.text(&id).unwrap().contains("Story number 2"));
+    assert_eq!(pipeline::render_previews(&library, &id, 30.0).unwrap().len(), entry.pages);
+
+    // Edits to an article carry into the edition when it's rebuilt; stories
+    // can be reordered and left out.
+    let mut draft = pipeline::load_draft(&library, &ids[2], &settings().format).unwrap().unwrap();
+    draft.meta.title = "Story three, revised".into();
+    pipeline::rebuild(&library, &ids[2], &draft, false).unwrap();
+    assert!(edition::is_stale(&library, &id, &ed), "the edition knows a story changed");
+    ed.move_member(2, true); // 1, 3, 2
+    ed.members[0].included = false;
+    ed.title = "The Weekend Paper".into();
+    let again = edition::rebuild(&library, &id, &ed).unwrap();
+    let main = std::fs::read_to_string(dir.join("main.typ")).unwrap();
+    assert!(!main.contains("Story number 1"));
+    assert!(main.find("Story three, revised").unwrap() < main.find("Story number 2").unwrap());
+    assert!(main.contains("title: \"The Weekend Paper\""));
+    assert!(again.entry.title.starts_with("The Weekend Paper"));
+    assert_eq!(again.entry.site_name.as_deref(), Some("2 stories"));
+    assert!(!edition::is_stale(&library, &id, &ed));
+
+    // Retypeset (the CLI path) understands editions too.
+    let retypeset = pipeline::retypeset(&library, &id, &settings()).unwrap();
+    assert_eq!(retypeset.kind, EntryKind::Edition);
+    assert!(pipeline::load_draft(&library, &id, &settings().format).unwrap().is_none(), "editions have no block draft");
+
+    // Deleting a story's article leaves a note instead of breaking the edition.
+    pipeline::delete_entry(&library, &ids[1]).unwrap();
+    let after = edition::rebuild(&library, &id, &ed).unwrap();
+    assert!(after.entry.warnings.iter().any(|w| w.contains("deleted")), "{:?}", after.entry.warnings);
+
+    // Only PDFs picked: nothing to lay out, and no half-made entry is left.
+    let before = library.entries().unwrap().len();
+    assert!(edition::create(&library, edition::new_from_settings(std::slice::from_ref(&pdf), &settings())).is_err());
+    assert_eq!(library.entries().unwrap().len(), before);
+}

@@ -26,8 +26,14 @@ cloud service, and no PDF reader is required to print.
 - **Edit by blocks.** The article is shown as blocks (headings, paragraphs,
   images, quotes, lists, code, tables). Untick a block to drop it, move it up
   or down, or rewrite its text in light Markdown (bold, italics and links are
-  kept). Title, byline and date are editable. *Restore original* undoes it
+  kept). Headings organise the list: blocks are indented under their
+  heading, a heading's checkbox prints or drops its **whole section** at
+  once, sections fold down to an outline, and moving a heading moves its
+  section. Title, byline and date are editable. *Restore original* undoes it
   all.
+- **Keyboard-friendly.** Move through the library with ↑ ↓ (or J K), tick
+  documents with Space or Shift+arrows, combine them with Ctrl+E, and reach
+  every main action with a shortcut. F1 lists them all.
 - **Format each document.** Paper, typeface, text size, columns, two pages
   per sheet, images (or grayscale images), link footnotes and the QR code are
   set per document. Settings holds the defaults for new ones.
@@ -54,12 +60,19 @@ cloud service, and no PDF reader is required to print.
   type and spacing *just enough* to use the fewest sheets (never below
   8.5 pt). A short article fits on a single sheet, and long reads take about
   half the paper.
+- **Editions: several articles printed like a newspaper.** Tick a handful of
+  articles and combine them into an *edition*. The stories run on one after
+  another through shared columns under a nameplate and an "In this edition"
+  list, instead of each starting a new page and ending half empty. Four short
+  reads that take five pages one by one fit on a single sheet.
 - **A print-friendly masthead.** Site, title, byline, date, reading time, the
   source URL and a **QR code** back to the original. Page headers and footers
   carry the title and page numbers.
-- **Direct printing.** Topebag prints through the standard Windows print
-  system, so any installed printer works. You choose the printer, copies and
-  quality.
+- **Direct printing.** Topebag prints through the system's own print queue
+  (Windows printing, or CUPS on macOS), so any installed printer works. You
+  choose the printer, copies and quality.
+- **Windows and macOS.** The same code builds on both; CI builds and tests
+  every push on each.
 - **A library.** Every document is saved with its PDF, images, edits and
   formatting. **Tag** documents, **search their full text**, reopen and
   re-edit any of them (missing images are fetched again), and reprint.
@@ -71,9 +84,14 @@ cloud service, and no PDF reader is required to print.
 - **A CLI as well.** `topebag add <url> [--print]`, `topebag instapaper
   --fetch-all`, `topebag search …` and more.
 
-## Quick start (Windows)
+## Quick start
 
-### 1. Prerequisites
+- [Windows](#windows)
+- [macOS](#macos)
+
+### Windows
+
+#### 1. Prerequisites
 
 | Requirement | How to get it |
 |---|---|
@@ -84,7 +102,7 @@ cloud service, and no PDF reader is required to print.
 Topebag is mostly pure Rust, but one dependency of Typst (`stacker`)
 compiles a few lines of C, and Rust needs the Windows SDK to link.
 
-### 2. Build and run
+#### 2. Build and run
 
 ```bash
 cargo run --release
@@ -94,6 +112,48 @@ The first build compiles several hundred crates and takes a few minutes.
 Later builds take seconds. The executable is at
 `target/release/topebag.exe`, and you can copy it anywhere because fonts and
 the template are compiled in.
+
+### macOS
+
+#### 1. Prerequisites
+
+| Requirement | How to get it |
+|---|---|
+| Xcode Command Line Tools (C compiler and linker) | `xcode-select --install` |
+| Rust (stable) | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh`, then open a new terminal |
+| Google Chrome or Microsoft Edge (optional) | Only needed for JavaScript-heavy and signed-in sites, found in `/Applications`. |
+
+Apple Silicon and Intel Macs both work.
+
+#### 2. Build and run
+
+```bash
+git clone https://github.com/jack-crawford/topebag.git
+cd topebag
+cargo run --release
+```
+
+The executable is `target/release/topebag`; copy it anywhere on your `PATH`
+(for example `cp target/release/topebag /usr/local/bin/`) to use the CLI too.
+
+#### What's different on a Mac
+
+- **Shortcuts use ⌘** wherever this README says Ctrl (⌘P prints, ⌘-click
+  ticks a document), and **⌘⌫** deletes the open document. The app's own
+  hints and its F1 list show the Mac keys.
+- **Printing** goes through CUPS: Topebag hands the PDF to `lp`, so every
+  printer in *System Settings → Printers & Scanners* works. `--print-to-file`
+  just copies the PDF.
+- **No menu-bar icon yet.** The tray icon is Windows-only for now, so closing
+  the window quits Topebag. *Open Topebag when you log in* (in Settings)
+  adds a LaunchAgent, `~/Library/LaunchAgents/io.github.jack-crawford.topebag.plist`.
+- **Data** lives in `~/Library/Application Support/Topebag/`.
+- **Fonts:** headings and the masthead use Helvetica Neue instead of Segoe
+  UI. Body text (Libertinus Serif) and code (DejaVu Sans Mono) are compiled
+  in, so they look the same on both systems.
+- **Paper size** follows your region (*System Settings → General → Language
+  & Region*): Letter in the US, Canada, Mexico and the Philippines, A4
+  elsewhere. Each document can still pick its own.
 
 > **Tip:** `cargo test` runs the test suite: unit tests plus offline
 > end-to-end tests of the whole pipeline (articles, PDFs, JavaScript pages,
@@ -108,7 +168,8 @@ the template are compiled in.
    or date, untick blocks you don't want on paper (ads that slipped through,
    "subscribe" boxes, author bios, a huge table), move blocks with **↑ ↓**,
    and click **✎** to rewrite a block's text. *Restore original* brings
-   everything back.
+   everything back. Headings work on their whole section; see
+   [Sections under headings](#sections-under-headings).
 3. **Format.** In the **Format** tab, choose paper, typeface, text size,
    columns, **two pages side by side** (with spacing fitted to the fewest
    sheets), images, link footnotes and the QR code. These apply to this
@@ -128,12 +189,61 @@ edits and formatting are remembered.
 | **Instapaper** | Your Instapaper queue (the button shows how many saves are waiting). |
 | **✎ Edit / Aa Format** | The document's editing and formatting tabs. |
 | **☑ ↑ ↓ ✎** on a block | Print or drop the block, move it, rewrite its text. |
+| **▾ / ▸** and **☑ ↑ ↓** on a heading | Fold or unfold its section; print or drop the whole section; move the section. |
+| **Collapse all / Expand all** | Fold the article down to an outline of headings, or show every block. |
+| **⌨** (F1) | The list of keyboard shortcuts. |
 | **Restore original** | Undo all edits (formatting is kept). |
 | **Fetch missing images** | Shown when some images couldn't be downloaded: try again. |
 | **🖨 Print** (Ctrl+P), **×copies**, **printer menu** | Print the document. |
 | **+ tag** | Tag the document (comma-separate several). Click a tag to remove it. |
 | **Open PDF / Show in folder** | Open the saved PDF in your viewer, or reveal it in Explorer. |
 | **Settings** (Ctrl+,) | Defaults and preferences, described below. |
+
+### Sections under headings
+
+A heading **heads a section**: everything after it up to the next heading of
+the same or a higher level. An H2's section takes in its H3 subsections and
+ends at the next H2. In the Edit tab:
+
+- Blocks are **indented** under their heading, so the article reads as an
+  outline.
+- A heading's **checkbox** prints or drops the heading and everything beneath
+  it in one click. If only part of the section prints (you dropped a table
+  inside it, say), the box shows a dash; clicking it then prints the whole
+  section again.
+- **▾ / ▸** folds a section away, leaving a note like "+6 blocks, 4 print".
+  **Collapse all** folds the whole article down to its headings, which makes
+  long reads easy to trim and reorder; **Expand all** opens everything again.
+  Folding only changes the view, never what prints.
+- **↑ ↓** on a heading moves its whole section past the neighbouring section
+  of the same level. With no neighbour at that level, it steps past one block
+  (moving it out of or into the surrounding section).
+
+### Keyboard shortcuts
+
+Press **F1** (or **?**, or the **⌨** button) for the full list. Plain-key
+shortcuts pause while you type in a field or after Tab focuses a button.
+Press Esc to get them back.
+
+| Keys | What they do |
+|---|---|
+| ↑ ↓ or K J, Home End, Page Up/Down | Open the previous / next / first / last document, or jump 10 |
+| Shift + those | Move and tick every document passed over |
+| Space | Tick or untick the open document |
+| Ctrl+A | Tick everything shown (press again to untick) |
+| Esc | Untick everything; leave a field (clears the search); close a window |
+| Ctrl+E | Combine the ticked articles into an edition |
+| Delete | Delete the open document (asks first; Enter confirms, Esc cancels) |
+| Ctrl+1 / Ctrl+2 | Edit (or Stories) tab / Format tab |
+| Ctrl+R or F5 | Update the preview now (editions: from the articles) |
+| Ctrl+P / Ctrl+O | Print / open the PDF in your viewer |
+| Ctrl+L / Ctrl+F or / | Go to the link bar / search the library |
+| Ctrl+V | Fetch the links on the clipboard (when not typing) |
+| Ctrl+I / Ctrl+, | Instapaper queue / Settings |
+| Tab, Shift+Tab | Move between buttons and fields (then arrows and Space) |
+
+In the search field, Enter goes to the results so ↑ ↓ walk through them, and
+Esc clears the search.
 
 ### Searching the library
 
@@ -204,6 +314,42 @@ turns each landscape sheet a quarter turn automatically, so it fills portrait
 paper. To convert a saved article, open it and tick the option in its Format
 tab (or run `topebag retypeset --side-by-side <id>`).
 
+### Printing several articles together (editions)
+
+Printing articles one at a time wastes the blank space at the end of each.
+An **edition** prints them like a newspaper instead:
+
+1. In the library, click **☑ Select** and tick the articles (or Ctrl+click
+   them; Shift+click ticks a range). Esc clears the selection.
+2. Click **📰 Combine into an edition**. Topebag lays the stories out together
+   and opens the new edition, marked 📰 EDITION in the library.
+3. In the **Stories** tab, rename the nameplate, choose whether page 1 lists
+   the stories with their page numbers, reorder stories (↑ ↓), leave some out,
+   or **Open** one to edit it. To add more, tick them in the library and
+   choose **Add to "…"**.
+4. The **Format** tab works like an article's: three columns at 9.5 pt by
+   default, with **Tighten spacing to use the fewest pages** on, plus paper,
+   typeface, images, links and a small QR code by each headline.
+5. Check the preview and **Print**.
+
+![An edition: four stories on one sheet](docs/sample-edition.png)
+
+Each story keeps its kicker (the site), headline, byline, date and reading
+time. A rule separates it from the one before, and a headline is never left
+alone at the foot of a column. A byline paragraph that repeats the header is
+dropped, pictures stay inside their own story, and later pages carry the
+nameplate and date in their running head.
+
+Stories come from each article's **current edits**: drop an ad block or fix
+a title in the article, then click **↻ Update from articles** in the edition
+(it lights up when an article changed). PDFs can't flow into columns, so
+they're left out. An edition keeps its own copies of the images, so it still
+prints if you later delete one of its articles; that story is skipped, with a
+note.
+
+From the command line: `topebag edition <id> <id> … [--columns 2]
+[--title "The Weekend Paper"] [--no-contents] [--no-fit] [--print]`.
+
 ### Settings
 
 | Setting | Default | Notes |
@@ -224,7 +370,7 @@ tab (or run `topebag retypeset --side-by-side <id>`).
 | Sites you've signed in to | — | Always loaded with Topebag's browser profile. |
 | Instapaper feed / fetch automatically / interval | — / off / 15 min | Fetched saves wait in the library; they're never printed by themselves. |
 | Keep running in the tray | on | Closing the window hides Topebag. Quit from the tray menu. |
-| Start with Windows | off | Adds Topebag to your per-user startup list (Task Manager → Startup apps). |
+| Start with Windows (macOS: Open Topebag when you log in) | off | Adds Topebag to your per-user startup list (Task Manager → Startup apps), or a LaunchAgent on macOS. |
 
 Paper through QR code are the **defaults for new documents**; each document
 keeps its own copy, changed in its Format tab. Settings are stored in
@@ -254,6 +400,8 @@ topebag tag <id> +reading -todo                    # add/remove tags
 topebag print <id>                                 # reprint a saved document
 topebag retypeset <id>                             # rebuild from its edits and format (fetches missing images)
 topebag retypeset --side-by-side <id>              # switch a document to spreads (--one-page to undo)
+topebag edition <id> <id> … [--print]              # combine articles into a newspaper-style edition
+topebag edition <ids…> --columns 2 --title "The Weekend Paper" --no-contents --no-fit
 topebag instapaper --feed <RSS URL>                # connect Instapaper
 topebag instapaper                                 # list waiting saves
 topebag instapaper --fetch-all [--print]           # fetch them (and optionally print)
@@ -265,6 +413,10 @@ topebag gui [--background] [URL…]                  # open the app (or hand lin
 ```
 
 ## Where your data lives
+
+On Windows it's `%LOCALAPPDATA%\Topebag`, on macOS
+`~/Library/Application Support/Topebag`, and on Linux `~/.local/share/topebag`
+(`topebag info` prints it):
 
 ```
 %LOCALAPPDATA%\Topebag\
@@ -282,6 +434,12 @@ topebag gui [--background] [URL…]                  # open the app (or hand lin
       img\…           downloaded images, normalised for print
       qr.svg          QR code
       document.pdf    the print-ready PDF (for PDF links: the original file)
+    2026-11-05_183629_edition-5-nov-2026\
+      entry.json      as above, with "kind": "Edition"
+      edition.json    nameplate, stories in order (included or not), contents, format
+      main.typ, document.pdf, article.txt (story titles)
+      img\…           copies of the stories' images (1-…, 2-… by story)
+      qr\…            one QR code per story
 ```
 
 Set the `TOPEBAG_HOME` environment variable to use a different folder, which
@@ -315,6 +473,9 @@ design decisions and how to extend Topebag. The API docs build with
 | A paywalled article is cut off | Add the site under *Sites you've signed in to* and sign in with **Open sign-in browser…**. |
 | A document's preview says "Updating…" and Print is disabled | Topebag is rebuilding after your last change; Print turns back on when the preview is current. |
 | Closing the window doesn't quit | That's *Keep running in the tray*. Quit from the tray icon's menu, or turn the setting off. |
+| macOS: `xcrun: error: invalid active developer path` or `linker 'cc' not found` | Install the Xcode Command Line Tools: `xcode-select --install`. |
+| macOS: "No printers found" | Add the printer in *System Settings → Printers & Scanners*; `lpstat -e` should then list it. |
+| macOS: JavaScript pages come back empty | Install Chrome or Edge in `/Applications`, or point `TOPEBAG_BROWSER` at a Chromium-based browser's executable. |
 | Instapaper says "not its RSS feed" | Copy the **RSS Feed** link from the Downloads menu, not the page address. |
 
 ## Project layout
@@ -327,6 +488,7 @@ src/
   extract.rs      Readability extraction and metadata
   images.rs       image download, normalisation and caching
   document.rs     editable drafts: blocks, Markdown edits, per-document format
+  edition.rs      editions: several articles laid out together like a newspaper
   convert.rs      HTML → Typst markup (escaping, structure)
   typeset.rs      embedded Typst compiler, fonts, PDF/raster output, PDF wrapper
   library.rs      on-disk library (entries, tags, plain text)
@@ -334,7 +496,7 @@ src/
   instapaper.rs   reading-queue feeds and their state
   search.rs       full-text search and query syntax
   instance.rs     single running instance and hand-off
-  autostart.rs    "Start with Windows"
+  autostart.rs    "Start with Windows" / macOS "Open at login"
   settings.rs     preferences
   print/          Windows GDI printing; CUPS on macOS/Linux
   main.rs, cli.rs executable entry point and CLI
@@ -348,8 +510,8 @@ examples/            render_pages: export an entry's pages as PNGs
 
 Done: articles, PDF links, JavaScript pages, sign-in sites, the Instapaper
 queue, tags, full-text search, tray icon, start with Windows, side-by-side
-spreads fitted to the fewest sheets, and the edit → format → preview → print
-workflow.
+spreads fitted to the fewest sheets, the edit → format → preview → print
+workflow, and newspaper-style editions of several articles.
 
 Possible next steps:
 
@@ -357,8 +519,10 @@ Possible next steps:
   a developer key)
 - Text extraction from PDFs, so PDF links are full-text searchable too
 - Booklet imposition (fold a stack of spreads into a booklet) and duplex printing
-- Combining several articles into one "digest" print with a table of
-  contents
+- Balance the columns on an edition's last page, and let a long story jump
+  ("continued on page 3") so the front page can hold more headlines
+- A one-click "this week's edition" from everything saved (or everything from
+  Instapaper) since the last one
 
 ## License
 

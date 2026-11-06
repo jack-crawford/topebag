@@ -17,6 +17,16 @@
 //! └──────────────────────────────────────────────────────────────────────┘
 //! ```
 //!
+//! Select several articles (Ctrl+click, Shift+click, or **Select**) and
+//! **Combine into an edition** to print them together like a newspaper: the
+//! stories run on through shared columns instead of each starting a fresh
+//! page. An edition opens in the same workspace, with a **Stories** tab
+//! (nameplate, order, which stories print) instead of the block editor.
+//!
+//! Everything is reachable from the keyboard too: ↑ ↓ (or J K) move through
+//! the library, Space and Shift+arrows tick documents, Ctrl+E combines them,
+//! and F1 lists every shortcut. The keys are decoded in [`keys`].
+//!
 //! Pasting a link creates a document and opens it. Every edit or format
 //! change marks the document *dirty*; after a short pause the draft is sent
 //! to the worker's rebuild thread, and the preview updates when the fresh
@@ -27,6 +37,7 @@
 //! messages from later launches are processed in `App::logic`, which eframe
 //! also runs while the window is hidden in the tray.
 
+mod keys;
 mod theme;
 mod tray;
 mod worker;
@@ -40,7 +51,8 @@ use anyhow::anyhow;
 use eframe::egui::{
     self, Align, Color32, Frame, Layout, Margin, RichText, Sense, Stroke, TextureHandle, Ui, ViewportCommand,
 };
-use topebag::document::{BlockKind, Draft};
+use topebag::document::{BlockKind, Draft, Inclusion};
+use topebag::edition::{self, Edition};
 use topebag::instapaper::{self, FeedItem, QueueState};
 use topebag::instance::{self, Message, Role};
 use topebag::library::{self, Entry, EntryKind, Library};
@@ -49,12 +61,16 @@ use topebag::search::{SearchIndex, parse_query};
 use topebag::settings::{BrowserMode, Format, LinkStyle, Paper, PrintQuality, Settings, Typeface};
 use topebag::{autostart, browser, fetch, pipeline};
 
+use self::keys::Command;
 use self::theme::{ACCENT, ACCENT_DARK, CARD, CARD_SELECTED, DANGER, HAIRLINE, MUTED, SUCCESS};
 use self::tray::TrayAction;
-use self::worker::{Event, JobId, Rebuild, Request, Worker};
+use self::worker::{Event, JobId, Rebuild, Request, Source, Worker};
 
 /// Pause after the last edit before the preview is rebuilt.
 const REBUILD_DELAY: Duration = Duration::from_millis(450);
+/// Pause on a newly opened document before rendering its preview, so holding
+/// ↓ through the library doesn't start a render for every entry passed.
+const PREVIEW_DELAY: Duration = Duration::from_millis(150);
 
 /// Launch the desktop app, queueing `initial_urls`. With `background`, it
 /// starts hidden in the system tray. If Topebag is already running, the
@@ -182,8 +198,13 @@ enum EditorTab {
 /// The document open in the editor.
 struct Editor {
     id: String,
-    /// `None` for PDFs, which print as they are.
+    /// The article's draft; `None` for PDFs (they print as they are) and
+    /// editions.
     draft: Option<Draft>,
+    /// Set when the open document is an edition.
+    edition: Option<Edition>,
+    /// An edition whose stories were edited after it was laid out.
+    stale: bool,
     tab: EditorTab,
     /// Block being rewritten: (index, Markdown buffer).
     editing: Option<(usize, String)>,
@@ -199,11 +220,32 @@ impl Editor {
     fn busy(&self) -> bool {
         self.rebuilding || self.dirty_since.is_some()
     }
+
+    /// What the worker should rebuild this document from.
+    fn source(&self, refill_images: bool) -> Option<Source> {
+        if let Some(edition) = &self.edition {
+            return Some(Source::Edition(edition.clone()));
+        }
+        self.draft.clone().map(|draft| Source::Draft { draft, refill_images })
+    }
+}
+
+/// Something done to a story in the edition editor.
+enum StoryAction {
+    Toggle(usize),
+    Up(usize),
+    Down(usize),
+    Remove(usize),
+    Open(String),
 }
 
 /// Something done to a block in the editor list.
 enum BlockAction {
     Toggle(usize),
+    /// A heading's checkbox: print (true) or leave out its whole section.
+    ToggleSection(usize, bool),
+    /// Fold or unfold the blocks under a heading.
+    Fold(usize),
     Up(usize),
     Down(usize),
     StartEdit(usize),
@@ -219,8 +261,29 @@ struct App {
     settings_draft: Option<SettingsDraft>,
     entries: Vec<Entry>,
     selected: Option<String>,
+    /// Articles ticked in the library for combining into an edition, in the
+    /// order they were picked.
+    picked: Vec<String>,
+    /// The library shows checkboxes and a click ticks instead of opening.
+    select_mode: bool,
     editor: Option<Editor>,
+    /// Folded headings (block ids) per document, kept while the app runs.
+    folds: HashMap<String, HashSet<u32>>,
     search: String,
+    /// Put the cursor in the search field next frame (Ctrl+F, /).
+    focus_search: bool,
+    /// Scroll the open document's card into view next frame (after a
+    /// keyboard move).
+    reveal_selected: bool,
+    /// A document opened recently whose preview hasn't been started yet.
+    preview_due: Option<(String, Instant)>,
+    /// A text field had keyboard focus last frame (Esc leaving a field
+    /// shouldn't also untick the library).
+    was_typing: bool,
+    show_shortcuts: bool,
+    /// A confirmation dialog has been on screen for a frame, so Enter now
+    /// means "confirm" (not the key press that opened it).
+    dialog_ready: bool,
     tag_filter: Option<String>,
     index: SearchIndex,
     new_tag: String,
@@ -281,8 +344,17 @@ impl App {
             settings_draft: None,
             entries: Vec::new(),
             selected: None,
+            picked: Vec::new(),
+            select_mode: false,
             editor: None,
+            folds: HashMap::new(),
             search: String::new(),
+            focus_search: false,
+            reveal_selected: false,
+            preview_due: None,
+            was_typing: false,
+            show_shortcuts: false,
+            dialog_ready: false,
             tag_filter: None,
             index: SearchIndex::default(),
             new_tag: String::new(),
@@ -334,16 +406,30 @@ impl App {
         }
         self.flush_pending_edits();
         if !self.previews.contains_key(&id) {
-            self.previews.insert(id.clone(), Preview::Loading);
-            self.worker.preview(id.clone());
+            self.preview_due = Some((id.clone(), Instant::now()));
         }
-        let (draft, error) = match pipeline::load_draft(&self.library, &id, &self.settings.format) {
-            Ok(draft) => (draft, None),
-            Err(err) => (None, Some(format!("This document can't be edited: {err:#}"))),
+        let kind = self.entries.iter().find(|e| e.id == id).map(|e| e.kind).unwrap_or_default();
+        let (mut edition_state, mut stale) = (None, false);
+        let (draft, error) = if kind == EntryKind::Edition {
+            match edition::load(&self.library, &id) {
+                Ok(e) => {
+                    stale = edition::is_stale(&self.library, &id, &e);
+                    edition_state = Some(e);
+                    (None, None)
+                }
+                Err(err) => (None, Some(format!("This edition can't be opened: {err:#}"))),
+            }
+        } else {
+            match pipeline::load_draft(&self.library, &id, &self.settings.format) {
+                Ok(draft) => (draft, None),
+                Err(err) => (None, Some(format!("This document can't be edited: {err:#}"))),
+            }
         };
         self.editor = Some(Editor {
             id: id.clone(),
             draft,
+            edition: edition_state,
+            stale,
             tab: EditorTab::Edit,
             editing: None,
             dirty_since: None,
@@ -354,6 +440,78 @@ impl App {
         self.selected = Some(id);
         self.new_tag.clear();
         self.confirm_restore = false;
+    }
+
+    /// Start the open document's preview once it has been open a moment.
+    fn start_due_preview(&mut self, ctx: &egui::Context) {
+        let Some((id, since)) = self.preview_due.clone() else { return };
+        if self.selected.as_ref() != Some(&id) {
+            self.preview_due = None;
+            return;
+        }
+        if since.elapsed() < PREVIEW_DELAY {
+            ctx.request_repaint_after(PREVIEW_DELAY - since.elapsed());
+            return;
+        }
+        self.preview_due = None;
+        if !self.previews.contains_key(&id) {
+            self.previews.insert(id.clone(), Preview::Loading);
+            self.worker.preview(id);
+        }
+    }
+
+    /// The library entries shown under the current search and tag filter, as
+    /// (index into `entries`, search snippet).
+    fn visible(&self) -> Vec<(usize, Option<String>)> {
+        let terms = parse_query(&self.search);
+        self.entries
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| self.tag_filter.as_ref().is_none_or(|t| e.tags.contains(t)))
+            .filter_map(|(i, e)| self.index.matches(e, &terms).map(|hit| (i, hit.snippet)))
+            .collect()
+    }
+
+    fn visible_ids(&self) -> Vec<String> {
+        self.visible().into_iter().map(|(i, _)| self.entries[i].id.clone()).collect()
+    }
+
+    /// Arrow keys and friends: open another document. With `extend`, also
+    /// tick every document passed over, starting with the one you were on.
+    fn move_cursor(&mut self, step: keys::Move, count: usize, extend: bool) {
+        let visible = self.visible_ids();
+        let from = self.selected.as_deref().and_then(|s| visible.iter().position(|v| v == s));
+        let Some(to) = keys::target(&visible, self.selected.as_deref(), step, count) else { return };
+        if extend {
+            for id in keys::passed_over(&visible, from.unwrap_or(to), to) {
+                if !self.picked.contains(&id) {
+                    self.picked.push(id);
+                }
+            }
+        }
+        self.reveal_selected = true;
+        self.select(visible[to].clone());
+    }
+
+    /// Rebuild the open document's preview now instead of after a pause.
+    fn refresh_preview(&mut self) {
+        let Some(editor) = self.editor.as_mut() else { return };
+        if editor.draft.is_some() || editor.edition.is_some() {
+            editor.dirty_since = Some(Instant::now().checked_sub(REBUILD_DELAY).unwrap_or_else(Instant::now));
+        } else {
+            let id = editor.id.clone();
+            self.previews.insert(id.clone(), Preview::Loading);
+            self.worker.preview(id);
+        }
+    }
+
+    fn open_pdf(&mut self) {
+        let Some(id) = self.selected.clone() else { return };
+        if let Ok(path) = self.library.pdf_path(&id) {
+            if let Err(err) = opener::open(&path) {
+                self.toast(format!("Could not open the PDF: {err}"), ToastKind::Error);
+            }
+        }
     }
 
     /// Send any unsaved edits of the open document before switching away.
@@ -368,8 +526,8 @@ impl App {
                 }
             }
             if editor.dirty_since.is_some() {
-                if let Some(draft) = editor.draft.clone() {
-                    self.worker.rebuild(Rebuild { id: editor.id.clone(), draft, refill_images: false });
+                if let Some(source) = editor.source(false) {
+                    self.worker.rebuild(Rebuild { id: editor.id.clone(), source });
                 }
             }
         }
@@ -392,11 +550,12 @@ impl App {
             ctx.request_repaint_after(REBUILD_DELAY - since.elapsed());
             return;
         }
-        if let Some(draft) = editor.draft.clone() {
+        if let Some(source) = editor.source(editor.refill_next) {
+            editor.refill_next = false;
             editor.dirty_since = None;
             editor.rebuilding = true;
-            let refill = std::mem::take(&mut editor.refill_next);
-            self.worker.rebuild(Rebuild { id: editor.id.clone(), draft, refill_images: refill });
+            editor.stale = false;
+            self.worker.rebuild(Rebuild { id: editor.id.clone(), source });
         } else {
             editor.dirty_since = None;
         }
@@ -455,6 +614,84 @@ impl App {
         self.worker.send(Request::Print { job, id, settings: self.settings.clone() });
     }
 
+    /// Combine the picked articles into a new edition.
+    fn create_edition(&mut self) {
+        let ids = self.picked_articles();
+        if ids.is_empty() {
+            self.toast("Pick some web articles first. PDFs can't flow into columns.", ToastKind::Error);
+            return;
+        }
+        let label = format!("Edition of {} articles", ids.len());
+        let job = self.new_job(label, None);
+        self.worker.send(Request::CreateEdition { job, ids, settings: self.settings.clone() });
+        self.picked.clear();
+        self.select_mode = false;
+    }
+
+    /// Add the picked articles to the edition that's open.
+    fn add_to_open_edition(&mut self) {
+        let ids = self.picked_articles();
+        let Some(edition) = self.editor.as_mut().and_then(|e| e.edition.as_mut()) else { return };
+        let mut added = 0;
+        for id in ids {
+            if !edition.members.iter().any(|m| m.id == id) {
+                edition.members.push(edition::Member { id, included: true });
+                added += 1;
+            }
+        }
+        self.picked.clear();
+        self.select_mode = false;
+        if added > 0 {
+            self.mark_dirty();
+            self.toast(format!("Added {added} stor{} to the edition.", if added == 1 { "y" } else { "ies" }), ToastKind::Success);
+        } else {
+            self.toast("Those articles are already in this edition.", ToastKind::Info);
+        }
+    }
+
+    /// Picked entries that can join an edition, in pick order.
+    fn picked_articles(&self) -> Vec<String> {
+        self.picked
+            .iter()
+            .filter(|id| self.entries.iter().any(|e| &e.id == *id && edition::can_join(e)))
+            .cloned()
+            .collect()
+    }
+
+    /// Ctrl+click: tick or untick one entry. Starting a selection this way
+    /// also ticks the document that's open, like a file manager.
+    fn toggle_pick(&mut self, id: String) {
+        if self.picked.is_empty() && !self.select_mode {
+            if let Some(open) = self.selected.clone().filter(|s| *s != id) {
+                self.picked.push(open);
+            }
+        }
+        if let Some(pos) = self.picked.iter().position(|p| *p == id) {
+            self.picked.remove(pos);
+        } else {
+            self.picked.push(id);
+        }
+    }
+
+    /// Shift+click: tick everything between the last ticked (or open) entry
+    /// and this one, in the order the library shows them.
+    fn pick_range(&mut self, visible: &[String], id: String) {
+        let anchor = self.picked.last().cloned().or_else(|| self.selected.clone());
+        let (Some(a), Some(b)) = (
+            anchor.as_ref().and_then(|a| visible.iter().position(|v| v == a)),
+            visible.iter().position(|v| *v == id),
+        ) else {
+            self.toggle_pick(id);
+            return;
+        };
+        let range: Vec<String> = if a <= b { visible[a..=b].to_vec() } else { visible[b..=a].iter().rev().cloned().collect() };
+        for v in range {
+            if !self.picked.contains(&v) {
+                self.picked.push(v);
+            }
+        }
+    }
+
     fn update_entry(&mut self, entry: Entry) {
         if let Err(err) = self.library.save(&entry) {
             self.toast(format!("Could not save: {err:#}"), ToastKind::Error);
@@ -494,7 +731,7 @@ impl App {
 
         if new.start_with_windows != autostart::is_enabled() {
             if let Err(err) = autostart::set_enabled(new.start_with_windows) {
-                self.toast(format!("Could not change “Start with Windows”: {err:#}"), ToastKind::Error);
+                self.toast(format!("Could not change “{}”: {err:#}", autostart::LABEL), ToastKind::Error);
                 new.start_with_windows = autostart::is_enabled();
             }
         }
@@ -575,12 +812,22 @@ impl App {
                     } else {
                         format!("{} page(s)", entry.pages)
                     };
+                    let edition = entry.kind == EntryKind::Edition;
                     if let Some(j) = self.job_mut(job) {
-                        j.status = JobStatus::Done(format!("Ready to edit · {size}"));
+                        j.status = JobStatus::Done(if edition {
+                            format!("Edition ready · {size}")
+                        } else {
+                            format!("Ready to edit · {size}")
+                        });
                         j.label = title.clone();
                         j.entry_id = Some(id.clone());
                     }
-                    self.toast(format!("“{title}” is ready: edit, format, then print"), ToastKind::Success);
+                    if edition {
+                        let stories = entry.site_name.clone().unwrap_or_default();
+                        self.toast(format!("Edition ready: {stories} on {size}. Check the preview, then print"), ToastKind::Success);
+                    } else {
+                        self.toast(format!("“{title}” is ready: edit, format, then print"), ToastKind::Success);
+                    }
                     self.index.add(&self.library, &entry);
                     self.reload_entries();
                     self.select(id);
@@ -751,17 +998,89 @@ impl App {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
-        let (print, settings) = ctx.input_mut(|i| {
-            (
-                i.consume_key(egui::Modifiers::COMMAND, egui::Key::P),
-                i.consume_key(egui::Modifiers::COMMAND, egui::Key::Comma),
-            )
-        });
-        if print {
-            self.print_selected();
+        let typing = ctx.text_edit_focused() || self.was_typing;
+        let cx = keys::KeyContext {
+            typing,
+            widget_focused: !typing && ctx.memory(|m| m.focused().is_some()),
+            dialog_open: self.confirm_delete.is_some() || self.confirm_restore,
+            window_open: self.show_shortcuts || self.settings_draft.is_some() || self.queue.show_window,
+        };
+        for command in keys::read(ctx, cx) {
+            self.run_command(command);
         }
-        if settings && self.settings_draft.is_none() {
-            self.open_settings();
+    }
+
+    fn run_command(&mut self, command: Command) {
+        match command {
+            Command::Move(step, count) => self.move_cursor(step, count, false),
+            Command::Extend(step, count) => self.move_cursor(step, count, true),
+            Command::TogglePick => {
+                if let Some(id) = self.selected.clone() {
+                    match self.picked.iter().position(|p| *p == id) {
+                        Some(pos) => {
+                            self.picked.remove(pos);
+                        }
+                        None => self.picked.push(id),
+                    }
+                }
+            }
+            Command::PickAll => {
+                let visible = self.visible_ids();
+                if !visible.is_empty() && visible.iter().all(|id| self.picked.contains(id)) {
+                    self.picked.clear();
+                } else {
+                    for id in visible {
+                        if !self.picked.contains(&id) {
+                            self.picked.push(id);
+                        }
+                    }
+                }
+            }
+            Command::Escape => {
+                if self.show_shortcuts {
+                    self.show_shortcuts = false;
+                } else if self.settings_draft.is_some() {
+                    self.settings_draft = None;
+                } else if self.queue.show_window {
+                    self.queue.show_window = false;
+                } else {
+                    self.picked.clear();
+                    self.select_mode = false;
+                }
+            }
+            Command::CombineEdition => {
+                if self.picked.is_empty() {
+                    self.toast(
+                        keys::display("Tick some articles first: Space ticks the open one, Shift+↑ ↓ ticks a run, Ctrl+A ticks them all."),
+                        ToastKind::Info,
+                    );
+                } else {
+                    self.create_edition();
+                }
+            }
+            Command::Delete => self.confirm_delete = self.selected.clone(),
+            Command::EditTab | Command::FormatTab => {
+                if let Some(editor) = self.editor.as_mut() {
+                    editor.tab = if command == Command::EditTab { EditorTab::Edit } else { EditorTab::Format };
+                }
+            }
+            Command::Refresh => self.refresh_preview(),
+            Command::Print => self.print_selected(),
+            Command::OpenPdf => self.open_pdf(),
+            Command::FocusLink => self.focus_url = true,
+            Command::FocusSearch => self.focus_search = true,
+            Command::Instapaper => {
+                self.queue.show_window = true;
+                if self.queue.items.is_empty() {
+                    self.check_feed();
+                }
+            }
+            Command::Settings => {
+                if self.settings_draft.is_none() {
+                    self.open_settings();
+                }
+            }
+            Command::Help => self.show_shortcuts = !self.show_shortcuts,
         }
     }
 
@@ -772,8 +1091,11 @@ impl App {
             ui.label(RichText::new("Topebag").family(theme::bold_family()).size(22.0).color(ACCENT));
             ui.label(RichText::new("links in, paper out").color(MUTED).italics());
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.button("⚙ Settings").on_hover_text("Settings (Ctrl+,)").clicked() {
+                if ui.button("⚙ Settings").on_hover_text(keys::display("Settings (Ctrl+,)")).clicked() {
                     self.open_settings();
+                }
+                if ui.button("⌨").on_hover_text("Keyboard shortcuts (F1)").clicked() {
+                    self.show_shortcuts = !self.show_shortcuts;
                 }
                 let waiting = self.unfetched().len();
                 let label = match (self.settings.instapaper_feed.is_some(), waiting) {
@@ -785,7 +1107,7 @@ impl App {
                 if waiting > 0 {
                     button = button.fill(CARD_SELECTED).stroke(Stroke::new(1.0, ACCENT));
                 }
-                if ui.add(button).on_hover_text("Your Instapaper queue").clicked() {
+                if ui.add(button).on_hover_text(keys::display("Your Instapaper queue (Ctrl+I)")).clicked() {
                     self.queue.show_window = true;
                     if self.queue.items.is_empty() {
                         self.check_feed();
@@ -856,13 +1178,40 @@ impl App {
         ui.horizontal(|ui| {
             ui.label(RichText::new("Library").family(theme::bold_family()).size(17.0));
             ui.label(RichText::new(format!("{}", self.entries.len())).color(MUTED));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let label = if self.select_mode { "Done" } else { "☑ Select" };
+                if ui
+                    .selectable_label(self.select_mode, RichText::new(label).small())
+                    .on_hover_text(keys::display(
+                        "Tick several articles to print them together as a newspaper-style edition. Or Ctrl+click / \
+                         Shift+click them; from the keyboard, Space ticks the open one and Shift+↑ ↓ ticks a run.",
+                    ))
+                    .clicked()
+                {
+                    self.select_mode = !self.select_mode;
+                    if !self.select_mode {
+                        self.picked.clear();
+                    }
+                }
+            });
         });
-        ui.add(
-            egui::TextEdit::singleline(&mut self.search)
-                .hint_text("🔍 Search titles, tags and article text")
-                .desired_width(f32::INFINITY),
-        )
-        .on_hover_text("Words must all match. Use \"a phrase\", tag:name, or -word to exclude.");
+        let search = ui
+            .add(
+                egui::TextEdit::singleline(&mut self.search)
+                    .hint_text(keys::display("🔍 Search titles, tags and article text  (Ctrl+F)"))
+                    .desired_width(f32::INFINITY),
+            )
+            .on_hover_text(
+                "Words must all match. Use \"a phrase\", tag:name, or -word to exclude. Enter goes to the results \
+                 (then ↑ ↓); Esc clears the search.",
+            );
+        if self.focus_search {
+            search.request_focus();
+            self.focus_search = false;
+        }
+        if search.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.search.clear();
+        }
 
         let mut tag_counts: BTreeMap<String, usize> = BTreeMap::new();
         for entry in &self.entries {
@@ -892,32 +1241,54 @@ impl App {
             return;
         }
 
-        let terms = parse_query(&self.search);
-        let visible: Vec<(usize, Option<String>)> = self
-            .entries
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| self.tag_filter.as_ref().is_none_or(|t| e.tags.contains(t)))
-            .filter_map(|(i, e)| self.index.matches(e, &terms).map(|hit| (i, hit.snippet)))
-            .collect();
+        let visible = self.visible();
 
-        let mut clicked: Option<String> = None;
+        let picking = self.select_mode || !self.picked.is_empty();
+        if picking {
+            self.batch_bar(ui);
+        }
+
+        let visible_ids: Vec<String> = visible.iter().map(|(i, _)| self.entries[*i].id.clone()).collect();
+        let mut clicked: Option<(String, egui::Modifiers)> = None;
+        let reveal = std::mem::take(&mut self.reveal_selected);
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
             for (i, snippet) in &visible {
                 let entry = &self.entries[*i];
-                let selected = self.selected.as_deref() == Some(entry.id.as_str());
+                let picked = self.picked.contains(&entry.id);
+                let is_open = self.selected.as_deref() == Some(entry.id.as_str());
+                // Ticked cards are filled; the open document (the keyboard
+                // cursor) is outlined, more heavily while ticking.
+                let filled = picked || (!picking && is_open);
+                let stroke = match (is_open, picked) {
+                    (true, _) if picking => Stroke::new(2.0, ACCENT_DARK),
+                    (true, _) | (_, true) => Stroke::new(1.0, ACCENT),
+                    _ => Stroke::new(1.0, HAIRLINE),
+                };
                 let response = Frame::new()
-                    .fill(if selected { CARD_SELECTED } else { CARD })
-                    .stroke(Stroke::new(1.0, if selected { ACCENT } else { HAIRLINE }))
+                    .fill(if filled { CARD_SELECTED } else { CARD })
+                    .stroke(stroke)
                     .corner_radius(8)
                     .inner_margin(Margin::symmetric(10, 8))
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
-                        ui.label(RichText::new(truncate(&entry.title, 110)).strong());
+                        if picking {
+                            ui.horizontal(|ui| {
+                                let mark = if picked { "☑" } else { "☐" };
+                                ui.label(RichText::new(mark).color(if picked { ACCENT } else { MUTED }));
+                                ui.add(egui::Label::new(RichText::new(truncate(&entry.title, 110)).strong()).wrap());
+                            });
+                        } else {
+                            ui.label(RichText::new(truncate(&entry.title, 110)).strong());
+                        }
                         ui.horizontal_wrapped(|ui| {
                             ui.spacing_mut().item_spacing.x = 4.0;
-                            if entry.kind == EntryKind::Pdf {
-                                ui.label(RichText::new("PDF").small().strong().color(ACCENT_DARK));
+                            let badge = match entry.kind {
+                                EntryKind::Pdf => Some("PDF"),
+                                EntryKind::Edition => Some("📰 EDITION"),
+                                EntryKind::Article => None,
+                            };
+                            if let Some(badge) = badge {
+                                ui.label(RichText::new(badge).small().strong().color(ACCENT_DARK));
                                 ui.label(RichText::new("·").small().color(MUTED));
                             }
                             let site = entry.site_name.clone().unwrap_or_else(|| entry.domain());
@@ -941,7 +1312,10 @@ impl App {
                     .response
                     .interact(Sense::click());
                 if response.clicked() {
-                    clicked = Some(entry.id.clone());
+                    clicked = Some((entry.id.clone(), ui.input(|i| i.modifiers)));
+                }
+                if reveal && is_open {
+                    response.scroll_to_me(None);
                 }
                 response.on_hover_cursor(egui::CursorIcon::PointingHand);
                 ui.add_space(2.0);
@@ -950,8 +1324,84 @@ impl App {
                 ui.label(RichText::new("No matches.").color(MUTED));
             }
         });
-        if let Some(id) = clicked {
-            self.select(id);
+        if let Some((id, modifiers)) = clicked {
+            if modifiers.shift {
+                self.pick_range(&visible_ids, id);
+            } else if modifiers.command || self.select_mode {
+                self.toggle_pick(id);
+            } else {
+                self.picked.clear();
+                self.select(id);
+            }
+        }
+    }
+
+    /// "3 selected · Combine into an edition · Clear", under the library.
+    fn batch_bar(&mut self, ui: &mut Ui) {
+        let articles = self.picked_articles().len();
+        let others = self.picked.len() - articles;
+        let open_edition = self
+            .editor
+            .as_ref()
+            .filter(|e| e.edition.is_some())
+            .and_then(|e| self.entries.iter().find(|x| x.id == e.id))
+            .map(|e| e.title.clone());
+        let (mut create, mut add, mut clear) = (false, false, false);
+        egui::Panel::bottom("batch-bar")
+            .frame(
+                Frame::new()
+                    .fill(CARD_SELECTED)
+                    .stroke(Stroke::new(1.0, ACCENT))
+                    .corner_radius(8)
+                    .inner_margin(Margin::symmetric(10, 8)),
+            )
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let text = match self.picked.len() {
+                        0 => "Tick the articles to print together".to_string(),
+                        n => format!("{n} selected"),
+                    };
+                    ui.label(RichText::new(text).strong());
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if ui.small_button("Clear").on_hover_text("Untick everything (Esc)").clicked() {
+                            clear = true;
+                        }
+                    });
+                });
+                if others > 0 {
+                    let what = if others == 1 { "1 PDF or edition is" } else { "PDFs and editions are" };
+                    ui.label(RichText::new(format!("{what} left out: only web articles flow into columns.")).small().color(MUTED));
+                }
+                ui.add_space(2.0);
+                let button = egui::Button::new(RichText::new("📰 Combine into an edition").color(Color32::WHITE).strong()).fill(ACCENT);
+                if ui
+                    .add_enabled(articles >= 1, button)
+                    .on_hover_text(keys::display(
+                        "Print these together like a newspaper: each story runs on straight after the last, through \
+                         shared columns, so no page ends half empty (Ctrl+E)",
+                    ))
+                    .clicked()
+                {
+                    create = true;
+                }
+                if let Some(title) = open_edition {
+                    if ui
+                        .add_enabled(articles >= 1, egui::Button::new(format!("Add to “{}”", truncate(&title, 28))))
+                        .on_hover_text("Add them to the end of the edition that's open")
+                        .clicked()
+                    {
+                        add = true;
+                    }
+                }
+            });
+        ui.add_space(4.0);
+        if create {
+            self.create_edition();
+        } else if add {
+            self.add_to_open_edition();
+        } else if clear {
+            self.picked.clear();
+            self.select_mode = false;
         }
     }
 
@@ -982,7 +1432,7 @@ impl App {
         ui.horizontal(|ui| {
             ui.label(RichText::new(truncate(&entry.title, 90)).family(theme::bold_family()).size(21.0));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.add(egui::Button::new(RichText::new("Delete").color(DANGER))).clicked() {
+                if ui.add(egui::Button::new(RichText::new("Delete").color(DANGER))).on_hover_text(keys::display("Delete (asks first; Delete or Ctrl+Backspace)")).clicked() {
                     self.confirm_delete = Some(entry.id.clone());
                 }
                 if ui.button("Show in folder").clicked() {
@@ -992,19 +1442,19 @@ impl App {
                         }
                     }
                 }
-                if ui.button("Open PDF").clicked() {
-                    if let Ok(path) = self.library.pdf_path(&entry.id) {
-                        if let Err(err) = opener::open(&path) {
-                            self.toast(format!("Could not open the PDF: {err}"), ToastKind::Error);
-                        }
-                    }
+                if ui.button("Open PDF").on_hover_text(keys::display("Open in your PDF viewer (Ctrl+O)")).clicked() {
+                    self.open_pdf();
                 }
             });
         });
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
             let site = entry.site_name.clone().unwrap_or_else(|| entry.domain());
-            ui.hyperlink_to(RichText::new(truncate(&site, 40)).small(), &entry.url).on_hover_text(&entry.url);
+            if entry.url.is_empty() {
+                ui.label(RichText::new(truncate(&site, 40)).small().color(MUTED));
+            } else {
+                ui.hyperlink_to(RichText::new(truncate(&site, 40)).small(), &entry.url).on_hover_text(&entry.url);
+            }
             let printed = match entry.print_count() {
                 0 => "not printed yet".to_string(),
                 1 => "printed once".to_string(),
@@ -1046,16 +1496,25 @@ impl App {
 
     fn editor_pane(&mut self, ui: &mut Ui, entry: &Entry) {
         let Some(tab) = self.editor.as_ref().map(|e| e.tab) else { return };
+        let is_edition = self.editor.as_ref().is_some_and(|e| e.edition.is_some());
         ui.horizontal(|ui| {
             let mut tab = tab;
-            ui.selectable_value(&mut tab, EditorTab::Edit, RichText::new("✎ Edit").strong());
-            ui.selectable_value(&mut tab, EditorTab::Format, RichText::new("Aa Format").strong());
+            let first = if is_edition { "📰 Stories" } else { "✎ Edit" };
+            ui.selectable_value(&mut tab, EditorTab::Edit, RichText::new(first).strong()).on_hover_text(keys::display("Ctrl+1"));
+            ui.selectable_value(&mut tab, EditorTab::Format, RichText::new("Aa Format").strong()).on_hover_text(keys::display("Ctrl+2"));
             if let Some(editor) = self.editor.as_mut() {
                 editor.tab = tab;
             }
         });
         ui.separator();
 
+        if is_edition {
+            match tab {
+                EditorTab::Edit => self.stories_tab(ui),
+                EditorTab::Format => self.edition_format_tab(ui),
+            }
+            return;
+        }
         let is_pdf = self.editor.as_ref().is_some_and(|e| e.draft.is_none());
         if is_pdf {
             let message = if entry.kind == EntryKind::Pdf {
@@ -1082,11 +1541,15 @@ impl App {
         let mut actions: Vec<BlockAction> = Vec::new();
         let mut refill = false;
         let mut ask_restore = false;
+        let mut fold_all: Option<bool> = None;
 
         {
             let Some(editor) = self.editor.as_mut() else { return };
             let editing = editor.editing.as_ref().map(|(i, _)| *i);
+            let folded = self.folds.get(&editor.id).cloned().unwrap_or_default();
             let Some(draft) = editor.draft.as_mut() else { return };
+            let has_sections = (0..draft.blocks.len())
+                .any(|i| matches!(draft.blocks[i].kind, BlockKind::Heading(_)) && draft.section(i).len() > 1);
 
             egui::Grid::new("meta").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
                 ui.label("Title");
@@ -1122,6 +1585,18 @@ impl App {
                     {
                         ask_restore = true;
                     }
+                    if has_sections {
+                        if ui.small_button("Expand all").on_hover_text("Show every block").clicked() {
+                            fold_all = Some(false);
+                        }
+                        if ui
+                            .small_button("Collapse all")
+                            .on_hover_text("Show just the headings: an outline you can reorder and trim section by section")
+                            .clicked()
+                        {
+                            fold_all = Some(true);
+                        }
+                    }
                     if image_trouble
                         && ui
                             .small_button("Fetch missing images")
@@ -1134,20 +1609,60 @@ impl App {
             });
             ui.separator();
 
+            let depths = draft.depths();
             egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt("blocks").show(ui, |ui| {
+                // Blocks inside a folded section are skipped up to this index.
+                let mut hidden_until = 0;
                 for (i, block) in draft.blocks.iter().enumerate() {
+                    if i < hidden_until {
+                        continue;
+                    }
                     let excluded = !block.included;
+                    // A heading with blocks beneath it heads a section: its
+                    // checkbox, fold arrow and ↑ ↓ act on the whole section.
+                    let section = draft.section(i);
+                    let heads_section = matches!(block.kind, BlockKind::Heading(_)) && section.len() > 1;
+                    let is_folded = heads_section && folded.contains(&block.id);
+                    if is_folded {
+                        hidden_until = section.end;
+                    }
+                    let inclusion = draft.section_inclusion(i);
+                    let indent = (depths[i].min(5) * 14) as i8;
                     Frame::new()
                         .fill(if excluded { Color32::from_rgb(0xF1, 0xEC, 0xE4) } else { CARD })
                         .stroke(Stroke::new(1.0, HAIRLINE))
                         .corner_radius(6)
                         .inner_margin(Margin::symmetric(8, 5))
+                        .outer_margin(Margin { left: indent, right: 0, top: 0, bottom: 0 })
                         .show(ui, |ui| {
                             ui.set_width(ui.available_width());
                             ui.horizontal(|ui| {
-                                let mut included = block.included;
-                                if ui.checkbox(&mut included, "").on_hover_text("Print this block").changed() {
-                                    actions.push(BlockAction::Toggle(i));
+                                if heads_section {
+                                    let (arrow, tip) = if is_folded {
+                                        ("▸", "Show the blocks under this heading")
+                                    } else {
+                                        ("▾", "Fold the blocks under this heading")
+                                    };
+                                    let fold = egui::Button::new(RichText::new(arrow).size(16.0).strong().color(ACCENT_DARK)).frame(false);
+                                    if ui.add(fold).on_hover_text(tip).clicked() {
+                                        actions.push(BlockAction::Fold(i));
+                                    }
+                                }
+                                let mut checked = inclusion != Inclusion::Nothing;
+                                let checkbox =
+                                    egui::Checkbox::new(&mut checked, "").indeterminate(inclusion == Inclusion::Partly);
+                                let tip = if heads_section {
+                                    "Print this heading and everything beneath it (a dash means only some of it prints)"
+                                } else {
+                                    "Print this block"
+                                };
+                                if ui.add(checkbox).on_hover_text(tip).changed() {
+                                    actions.push(if heads_section {
+                                        // Partly printed → print it all; all → none.
+                                        BlockAction::ToggleSection(i, inclusion != Inclusion::All)
+                                    } else {
+                                        BlockAction::Toggle(i)
+                                    });
                                 }
                                 let label_color = if excluded { MUTED } else { ACCENT_DARK };
                                 ui.add_sized(
@@ -1161,10 +1676,15 @@ impl App {
                                     {
                                         actions.push(BlockAction::StartEdit(i));
                                     }
-                                    if ui.small_button("↓").on_hover_text("Move down").clicked() {
+                                    let (down, up) = if heads_section {
+                                        ("Move down, with everything beneath it", "Move up, with everything beneath it")
+                                    } else {
+                                        ("Move down", "Move up")
+                                    };
+                                    if ui.small_button("↓").on_hover_text(down).clicked() {
                                         actions.push(BlockAction::Down(i));
                                     }
-                                    if ui.small_button("↑").on_hover_text("Move up").clicked() {
+                                    if ui.small_button("↑").on_hover_text(up).clicked() {
                                         actions.push(BlockAction::Up(i));
                                     }
                                     let mut text = RichText::new(block.preview());
@@ -1178,6 +1698,17 @@ impl App {
                                         ui.add(egui::Label::new(text).wrap());
                                         if block.edited.is_some() {
                                             ui.label(RichText::new("edited").small().italics().color(ACCENT));
+                                        }
+                                        if is_folded {
+                                            let hidden = section.len() - 1;
+                                            let printed = draft.blocks[section.clone()].iter().skip(1).filter(|b| b.included).count();
+                                            let note = match (hidden, printed) {
+                                                (1, 1) => "+1 block".to_string(),
+                                                (1, _) => "+1 block, left out".to_string(),
+                                                (n, p) if p == n => format!("+{n} blocks"),
+                                                (n, p) => format!("+{n} blocks, {p} print"),
+                                            };
+                                            ui.label(RichText::new(note).small().color(MUTED));
                                         }
                                     });
                                 });
@@ -1214,7 +1745,13 @@ impl App {
 
         // Apply what happened, now that nothing is borrowed.
         for action in actions {
-            changed |= self.apply_block_action(action);
+            match action {
+                BlockAction::Fold(i) => self.toggle_fold(i),
+                action => changed |= self.apply_block_action(action),
+            }
+        }
+        if let Some(fold) = fold_all {
+            self.fold_all(fold);
         }
         if ask_restore {
             self.confirm_restore = true;
@@ -1230,6 +1767,30 @@ impl App {
         }
     }
 
+    /// Fold or unfold the section under heading `index` of the open draft.
+    fn toggle_fold(&mut self, index: usize) {
+        let Some(editor) = self.editor.as_ref() else { return };
+        let Some(block) = editor.draft.as_ref().and_then(|d| d.blocks.get(index)) else { return };
+        let folds = self.folds.entry(editor.id.clone()).or_default();
+        if !folds.remove(&block.id) {
+            folds.insert(block.id);
+        }
+    }
+
+    /// Fold every section (an outline of headings) or unfold them all.
+    fn fold_all(&mut self, fold: bool) {
+        let Some(editor) = self.editor.as_ref() else { return };
+        let folds = self.folds.entry(editor.id.clone()).or_default();
+        folds.clear();
+        if let (true, Some(draft)) = (fold, editor.draft.as_ref()) {
+            for (i, block) in draft.blocks.iter().enumerate() {
+                if matches!(block.kind, BlockKind::Heading(_)) && draft.section(i).len() > 1 {
+                    folds.insert(block.id);
+                }
+            }
+        }
+    }
+
     /// Returns true if the draft changed.
     fn apply_block_action(&mut self, action: BlockAction) -> bool {
         let Some(editor) = self.editor.as_mut() else { return false };
@@ -1241,17 +1802,24 @@ impl App {
                 }
                 true
             }
+            BlockAction::ToggleSection(i, included) => {
+                draft.set_section_included(i, included);
+                true
+            }
+            BlockAction::Fold(_) => false,
             BlockAction::Up(i) | BlockAction::Down(i) => {
+                // Headings move with their section; follow the block being
+                // rewritten (by id) wherever the move puts it.
                 let up = matches!(action, BlockAction::Up(_));
-                let to = draft.move_block(i, up);
-                if let Some((editing, _)) = editor.editing.as_mut() {
-                    if *editing == i {
-                        *editing = to;
-                    } else if *editing == to {
-                        *editing = i;
+                let before: Vec<u32> = draft.blocks.iter().map(|b| b.id).collect();
+                let editing_id = editor.editing.as_ref().and_then(|(e, _)| before.get(*e).copied());
+                draft.move_section(i, up);
+                if let (Some(id), Some((editing, _))) = (editing_id, editor.editing.as_mut()) {
+                    if let Some(pos) = draft.blocks.iter().position(|b| b.id == id) {
+                        *editing = pos;
                     }
                 }
-                to != i
+                draft.blocks.iter().map(|b| b.id).ne(before.iter().copied())
             }
             BlockAction::StartEdit(i) => {
                 let text = draft.blocks.get(i).map(|b| b.markdown()).unwrap_or_default();
@@ -1290,7 +1858,7 @@ impl App {
             egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt("format").show(ui, |ui| {
                 ui.label(RichText::new("These settings apply to this document only.").small().color(MUTED));
                 ui.add_space(4.0);
-                changed |= format_controls(ui, "doc", &mut draft.format);
+                changed |= format_controls(ui, "doc", &mut draft.format, false);
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     if ui
@@ -1316,6 +1884,180 @@ impl App {
         }
     }
 
+    /// The edition editor: nameplate, front-page contents, and the stories
+    /// in print order.
+    fn stories_tab(&mut self, ui: &mut Ui) {
+        let mut changed = false;
+        let mut actions: Vec<StoryAction> = Vec::new();
+        let mut update = false;
+        {
+            let entries = &self.entries;
+            let Some(editor) = self.editor.as_mut() else { return };
+            let stale = editor.stale;
+            let Some(ed) = editor.edition.as_mut() else { return };
+
+            egui::Grid::new("edition-meta").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                ui.label("Nameplate");
+                changed |= ui
+                    .add(egui::TextEdit::singleline(&mut ed.title).hint_text("The Topebag").desired_width(f32::INFINITY))
+                    .changed();
+                ui.end_row();
+                ui.label("Front page");
+                changed |= ui.checkbox(&mut ed.contents, "List the stories and their page numbers under the nameplate").changed();
+                ui.end_row();
+            });
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                let included = ed.members.iter().filter(|m| m.included).count();
+                ui.label(
+                    RichText::new(format!("{included} of {} stories will print, one after another", ed.members.len()))
+                        .small()
+                        .color(MUTED),
+                );
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let mut button = egui::Button::new("↻ Update from articles").small();
+                    if stale {
+                        button = button.fill(CARD_SELECTED).stroke(Stroke::new(1.0, ACCENT));
+                    }
+                    if ui.add(button).on_hover_text("Lay the edition out again with the latest edits to each article").clicked() {
+                        update = true;
+                    }
+                });
+            });
+            if stale {
+                ui.label(
+                    RichText::new("Some of these articles were edited after this edition was laid out.").small().color(ACCENT),
+                );
+            }
+            ui.separator();
+
+            let count = ed.members.len();
+            egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt("stories").show(ui, |ui| {
+                for (i, member) in ed.members.iter().enumerate() {
+                    let entry = entries.iter().find(|e| e.id == member.id);
+                    let usable = entry.is_some_and(edition::can_join);
+                    let excluded = !member.included || !usable;
+                    Frame::new()
+                        .fill(if excluded { Color32::from_rgb(0xF1, 0xEC, 0xE4) } else { CARD })
+                        .stroke(Stroke::new(1.0, HAIRLINE))
+                        .corner_radius(6)
+                        .inner_margin(Margin::symmetric(8, 6))
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal(|ui| {
+                                let mut included = member.included;
+                                if ui.add_enabled(usable, egui::Checkbox::new(&mut included, "")).on_hover_text("Print this story").changed() {
+                                    actions.push(StoryAction::Toggle(i));
+                                }
+                                ui.add_sized(
+                                    [22.0, 18.0],
+                                    egui::Label::new(RichText::new(format!("{}", i + 1)).strong().color(ACCENT_DARK)),
+                                );
+                                ui.with_layout(Layout::right_to_left(Align::Min), |ui| {
+                                    if ui
+                                        .add_enabled(count > 1, egui::Button::new("✖").small())
+                                        .on_hover_text("Take this story out of the edition (the article stays in your library)")
+                                        .clicked()
+                                    {
+                                        actions.push(StoryAction::Remove(i));
+                                    }
+                                    if ui.small_button("↓").on_hover_text("Move down").clicked() {
+                                        actions.push(StoryAction::Down(i));
+                                    }
+                                    if ui.small_button("↑").on_hover_text("Move up").clicked() {
+                                        actions.push(StoryAction::Up(i));
+                                    }
+                                    if usable
+                                        && ui
+                                            .small_button("Open")
+                                            .on_hover_text("Edit this article, then come back and Update the edition")
+                                            .clicked()
+                                    {
+                                        actions.push(StoryAction::Open(member.id.clone()));
+                                    }
+                                    ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                                        match entry {
+                                            Some(e) => {
+                                                let mut title = RichText::new(truncate(&e.title, 120)).strong();
+                                                if excluded {
+                                                    title = title.strikethrough().color(MUTED);
+                                                }
+                                                ui.add(egui::Label::new(title).wrap());
+                                                let site = e.site_name.clone().unwrap_or_else(|| e.domain());
+                                                let note = if usable { site } else { format!("{site} · PDFs can't be part of an edition") };
+                                                ui.label(RichText::new(truncate(&note, 70)).small().color(MUTED));
+                                            }
+                                            None => {
+                                                ui.label(RichText::new("Deleted from the library").italics().color(MUTED));
+                                            }
+                                        }
+                                    });
+                                });
+                            });
+                        });
+                    ui.add_space(3.0);
+                }
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new(
+                        keys::display("To add stories, tick articles in the library (☑ Select or Ctrl+click), then choose “Add to …”."),
+                    )
+                    .small()
+                    .color(MUTED),
+                );
+            });
+        }
+
+        let mut open: Option<String> = None;
+        if let Some(ed) = self.editor.as_mut().and_then(|e| e.edition.as_mut()) {
+            for action in actions {
+                match action {
+                    StoryAction::Toggle(i) => {
+                        if let Some(m) = ed.members.get_mut(i) {
+                            m.included = !m.included;
+                            changed = true;
+                        }
+                    }
+                    StoryAction::Up(i) => changed |= ed.move_member(i, true) != i,
+                    StoryAction::Down(i) => changed |= ed.move_member(i, false) != i,
+                    StoryAction::Remove(i) => {
+                        if ed.members.len() > 1 && i < ed.members.len() {
+                            ed.members.remove(i);
+                            changed = true;
+                        }
+                    }
+                    StoryAction::Open(id) => open = Some(id),
+                }
+            }
+        }
+        if changed || update {
+            self.mark_dirty();
+        }
+        if let Some(id) = open {
+            self.select(id);
+        }
+    }
+
+    fn edition_format_tab(&mut self, ui: &mut Ui) {
+        let defaults = self.settings.format.clone();
+        let mut changed = false;
+        let Some(ed) = self.editor.as_mut().and_then(|e| e.edition.as_mut()) else { return };
+        egui::ScrollArea::vertical().auto_shrink([false, false]).id_salt("edition-format").show(ui, |ui| {
+            ui.label(RichText::new("These settings apply to this edition only.").small().color(MUTED));
+            ui.add_space(4.0);
+            changed |= format_controls(ui, "edition", &mut ed.format, true);
+            ui.add_space(10.0);
+            let newspaper = Edition::new(&[], &defaults).format;
+            if ui.add_enabled(ed.format != newspaper, egui::Button::new("Reset to newspaper defaults")).clicked() {
+                ed.format = newspaper;
+                changed = true;
+            }
+        });
+        if changed {
+            self.mark_dirty();
+        }
+    }
+
     fn preview_pane(&mut self, ui: &mut Ui, entry: &Entry) {
         let (busy, error) = self.editor.as_ref().map(|e| (e.busy(), e.error.clone())).unwrap_or((false, None));
 
@@ -1329,7 +2071,7 @@ impl App {
                             !busy,
                             egui::Button::new(RichText::new("🖨 Print").color(Color32::WHITE).strong()).fill(ACCENT),
                         )
-                        .on_hover_text("Print this document (Ctrl+P)")
+                        .on_hover_text(keys::display("Print this document (Ctrl+P)"))
                         .on_disabled_hover_text("Updating the preview…");
                     if print.clicked() {
                         self.print_selected();
@@ -1352,7 +2094,7 @@ impl App {
                 (false, 1) => "1 page".to_string(),
                 (false, n) => format!("{n} pages"),
             };
-            let tightened = if entry.spread && entry.density > 0.005 {
+            let tightened = if entry.density > 0.005 {
                 format!(" · spacing tightened {:.0}%", entry.density * 100.0)
             } else {
                 String::new()
@@ -1427,11 +2169,13 @@ impl App {
                 ("2", "Edit: drop ads and asides, fix the title, rewrite a paragraph"),
                 ("3", "Format: paper, type size, two pages per sheet… and watch the preview"),
                 ("4", "Print. Every document stays in your library"),
+                ("5", "Several to print? Tick them (☑ Select) and combine them into a newspaper-style edition"),
+                ("⌨", "Prefer the keyboard? ↑ ↓ move through the library; F1 lists every shortcut"),
             ] {
                 ui.horizontal(|ui| {
                     ui.add_space((ui.available_width() - 520.0).max(0.0) / 2.0);
                     ui.label(RichText::new(n).strong().color(ACCENT));
-                    ui.label(text);
+                    ui.label(keys::display(text));
                 });
             }
         });
@@ -1698,7 +2442,7 @@ impl App {
                     ui.label(
                         RichText::new("Each document can be formatted on its own in its Format tab.").small().color(MUTED),
                     );
-                    format_controls(ui, "defaults", &mut s.format);
+                    format_controls(ui, "defaults", &mut s.format, false);
 
                     section(ui, "JavaScript pages and sign-ins");
                     if !has_browser {
@@ -1762,8 +2506,9 @@ impl App {
                     ui.add_enabled(
                         has_tray,
                         egui::Checkbox::new(&mut s.close_to_tray, "Keep running in the tray when the window is closed"),
-                    );
-                    ui.add_enabled(cfg!(windows), egui::Checkbox::new(&mut s.start_with_windows, "Start with Windows (in the tray)"));
+                    )
+                    .on_disabled_hover_text("The tray icon is only available on Windows for now");
+                    ui.add_enabled(autostart::SUPPORTED, egui::Checkbox::new(&mut s.start_with_windows, autostart::LABEL));
 
                     section(ui, "Library");
                     ui.horizontal(|ui| {
@@ -1797,14 +2542,22 @@ impl App {
         let Some(id) = self.confirm_delete.clone() else { return };
         let title = self.entries.iter().find(|e| e.id == id).map(|e| e.title.clone()).unwrap_or_default();
         let mut close = false;
-        egui::Modal::new(egui::Id::unique("confirm-delete")).show(ctx, |ui| {
+        let enter = self.dialog_enter(ctx);
+        let modal = egui::Modal::new(egui::Id::unique("confirm-delete")).show(ctx, |ui| {
             ui.set_max_width(380.0);
             ui.label(RichText::new("Delete this document?").family(theme::bold_family()).size(18.0));
             ui.label(RichText::new(truncate(&title, 120)).color(MUTED));
-            ui.label("The PDF, its images and your edits will be removed from the library.");
+            if self.entries.iter().any(|e| e.id == id && e.kind == EntryKind::Edition) {
+                ui.label("The edition's PDF will be removed. The articles in it stay in your library.");
+            } else {
+                ui.label("The PDF, its images and your edits will be removed from the library.");
+            }
             ui.add_space(8.0);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.add(egui::Button::new(RichText::new("Delete").color(Color32::WHITE).strong()).fill(DANGER)).clicked() {
+                let delete = ui
+                    .add(egui::Button::new(RichText::new("Delete").color(Color32::WHITE).strong()).fill(DANGER))
+                    .on_hover_text("Enter");
+                if delete.clicked() || enter {
                     match pipeline::delete_entry(&self.library, &id) {
                         Ok(()) => {
                             self.previews.remove(&id);
@@ -1819,13 +2572,14 @@ impl App {
                     }
                     close = true;
                 }
-                if ui.button("Cancel").clicked() {
+                if ui.button("Cancel").on_hover_text("Esc").clicked() {
                     close = true;
                 }
             });
         });
-        if close {
+        if close || modal.should_close() {
             self.confirm_delete = None;
+            self.dialog_ready = false;
             self.reload_entries();
         }
     }
@@ -1836,21 +2590,26 @@ impl App {
         }
         let mut close = false;
         let mut restore = false;
-        egui::Modal::new(egui::Id::unique("confirm-restore")).show(ctx, |ui| {
+        let enter = self.dialog_enter(ctx);
+        let modal = egui::Modal::new(egui::Id::unique("confirm-restore")).show(ctx, |ui| {
             ui.set_max_width(380.0);
             ui.label(RichText::new("Restore the original?").family(theme::bold_family()).size(18.0));
             ui.label("All blocks come back, unedited and in their original order, and the title, byline and date are reset. Formatting is kept.");
             ui.add_space(8.0);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.add(egui::Button::new(RichText::new("Restore").color(Color32::WHITE).strong()).fill(ACCENT)).clicked() {
+                let confirm = ui
+                    .add(egui::Button::new(RichText::new("Restore").color(Color32::WHITE).strong()).fill(ACCENT))
+                    .on_hover_text("Enter");
+                if confirm.clicked() || enter {
                     restore = true;
                     close = true;
                 }
-                if ui.button("Cancel").clicked() {
+                if ui.button("Cancel").on_hover_text("Esc").clicked() {
                     close = true;
                 }
             });
         });
+        close |= modal.should_close();
         if restore {
             let id = self.editor.as_ref().map(|e| e.id.clone());
             if let Some(id) = id {
@@ -1870,6 +2629,53 @@ impl App {
         }
         if close {
             self.confirm_restore = false;
+            self.dialog_ready = false;
+        }
+    }
+
+    /// Enter in a confirmation dialog, once it has been on screen for a frame
+    /// (so the key press that opened it can't also confirm it).
+    fn dialog_enter(&mut self, ctx: &egui::Context) -> bool {
+        let ready = std::mem::replace(&mut self.dialog_ready, true);
+        ready && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter))
+    }
+
+    fn shortcuts_window(&mut self, ctx: &egui::Context) {
+        if !self.show_shortcuts {
+            return;
+        }
+        let mut open = true;
+        egui::Window::new("Keyboard shortcuts")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .default_width(600.0)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().max_height(560.0).show(ui, |ui| {
+                    for (group, rows) in keys::GROUPS {
+                        section(ui, group);
+                        egui::Grid::new(format!("keys-{group}")).num_columns(2).spacing([24.0, 5.0]).show(ui, |ui| {
+                            for (keys, what) in *rows {
+                                ui.label(RichText::new(keys::display(keys)).strong().color(ACCENT_DARK));
+                                ui.label(keys::display(what));
+                                ui.end_row();
+                            }
+                        });
+                    }
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new(
+                            "Plain-key shortcuts pause while you type in a field or after Tab focuses a button. \
+                             Press Esc to get them back.",
+                        )
+                        .small()
+                        .color(MUTED),
+                    );
+                });
+            });
+        if !open {
+            self.show_shortcuts = false;
         }
     }
 
@@ -1916,6 +2722,7 @@ impl eframe::App for App {
         self.process_tray_and_instance(ctx);
         self.handle_close(ctx);
         self.maybe_rebuild(ctx);
+        self.start_due_preview(ctx);
         if self.feed_due() {
             self.check_feed();
         }
@@ -1952,22 +2759,32 @@ impl eframe::App for App {
         self.settings_window(&ctx);
         self.delete_dialog(&ctx);
         self.restore_dialog(&ctx);
+        self.shortcuts_window(&ctx);
         self.toasts(&ctx);
+        self.was_typing = ctx.text_edit_focused();
     }
 }
 
-/// Controls for a [`Format`]; used by a document's Format tab and by the
-/// defaults in Settings. Returns true if anything changed.
-fn format_controls(ui: &mut Ui, id: &str, f: &mut Format) -> bool {
+/// Controls for a [`Format`]; used by a document's Format tab, an edition's
+/// Format tab (`edition`: no side-by-side, fitting is always available) and
+/// the defaults in Settings. Returns true if anything changed.
+fn format_controls(ui: &mut Ui, id: &str, f: &mut Format, edition: bool) -> bool {
     let before = f.clone();
     egui::Grid::new(format!("format-{id}")).num_columns(2).spacing([18.0, 8.0]).show(ui, |ui| {
-        ui.label("Spread");
-        ui.vertical(|ui| {
-            ui.checkbox(&mut f.side_by_side, "Two pages side by side on each sheet")
-                .on_hover_text("Each landscape sheet holds two half-size pages, like an open book");
-            ui.add_enabled(f.side_by_side, egui::Checkbox::new(&mut f.fit_to_sheets, "Tighten spacing to use the fewest sheets"))
-                .on_hover_text("Shrinks text, spacing and margins only as much as needed to save a sheet (text never below 8.5 pt)");
-        });
+        if edition {
+            ui.label("Layout");
+            ui.checkbox(&mut f.fit_to_sheets, "Tighten spacing to use the fewest pages").on_hover_text(
+                "Shrinks text, spacing and margins only as much as needed to save a page (text never below 8.5 pt)",
+            );
+        } else {
+            ui.label("Spread");
+            ui.vertical(|ui| {
+                ui.checkbox(&mut f.side_by_side, "Two pages side by side on each sheet")
+                    .on_hover_text("Each landscape sheet holds two half-size pages, like an open book");
+                ui.add_enabled(f.side_by_side, egui::Checkbox::new(&mut f.fit_to_sheets, "Tighten spacing to use the fewest sheets"))
+                    .on_hover_text("Shrinks text, spacing and margins only as much as needed to save a sheet (text never below 8.5 pt)");
+            });
+        }
         ui.end_row();
         ui.label("Paper");
         combo(ui, &format!("{id}-paper"), &mut f.paper, &Paper::ALL, |p| p.label());
@@ -1979,10 +2796,11 @@ fn format_controls(ui: &mut Ui, id: &str, f: &mut Format) -> bool {
         ui.add(egui::Slider::new(&mut f.font_size, 8.0..=16.0).step_by(0.5).suffix(" pt"));
         ui.end_row();
         ui.label("Columns");
-        ui.add_enabled_ui(!f.side_by_side, |ui| {
+        ui.add_enabled_ui(edition || !f.side_by_side, |ui| {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut f.columns, 1, "One");
                 ui.selectable_value(&mut f.columns, 2, "Two");
+                ui.selectable_value(&mut f.columns, 3, "Three");
             });
         })
         .response
@@ -2001,7 +2819,8 @@ fn format_controls(ui: &mut Ui, id: &str, f: &mut Format) -> bool {
         combo(ui, &format!("{id}-links"), &mut f.link_style, &LinkStyle::ALL, |l| l.label());
         ui.end_row();
         ui.label("QR code");
-        ui.checkbox(&mut f.qr_code, "Link back to the original");
+        let qr = if edition { "A small code by each headline, linking to the original" } else { "Link back to the original" };
+        ui.checkbox(&mut f.qr_code, qr);
         ui.end_row();
     });
     f.sanitize();

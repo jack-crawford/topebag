@@ -5,9 +5,10 @@
 //! * One **job thread** processes [`Request`]s in order (fetching links,
 //!   printing, feed checks). Running jobs one at a time keeps print order
 //!   predictable and avoids hammering sites with parallel downloads.
-//! * One **rebuild thread** turns the editor's drafts into fresh PDFs and
-//!   preview pages. While you type, it only ever works on the *latest* draft
-//!   of each document, so a burst of edits costs one rebuild, not dozens.
+//! * One **rebuild thread** turns the editor's drafts (and editions) into
+//!   fresh PDFs and preview pages. While you type, it only ever works on the
+//!   *latest* draft of each document, so a burst of edits costs one rebuild,
+//!   not dozens.
 //! * **Previews** of unchanged documents and the **search index** are built
 //!   on short-lived threads of their own.
 //!
@@ -20,6 +21,7 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use eframe::egui;
 
 use topebag::document::Draft;
+use topebag::edition::{self, Edition};
 use topebag::instapaper::{self, FeedItem};
 use topebag::library::{Entry, Library, PrintRecord};
 use topebag::pipeline::{self, PrintTarget};
@@ -36,16 +38,35 @@ pub type JobId = u64;
 pub enum Request {
     Add { job: JobId, url: Url, settings: Settings },
     Print { job: JobId, id: String, settings: Settings },
+    /// Combine articles into a new edition (reported as [`Event::Added`]).
+    CreateEdition { job: JobId, ids: Vec<String>, settings: Settings },
     RefreshPrinters,
     CheckFeed { url: Url },
 }
 
-/// A draft to rebuild (see [`Worker::rebuild`]).
+/// A document to rebuild (see [`Worker::rebuild`]).
 pub struct Rebuild {
     pub id: String,
-    pub draft: Draft,
-    /// Download images that aren't stored yet.
-    pub refill_images: bool,
+    pub source: Source,
+}
+
+/// What a document is rebuilt from.
+pub enum Source {
+    /// An article's edited draft.
+    Draft {
+        draft: Draft,
+        /// Download images that aren't stored yet.
+        refill_images: bool,
+    },
+    /// An edition's story list and format (stories come from each article's
+    /// current draft).
+    Edition(Edition),
+}
+
+impl Source {
+    fn refill_images(&self) -> bool {
+        matches!(self, Source::Draft { refill_images: true, .. })
+    }
 }
 
 /// Results reported back to the UI.
@@ -105,14 +126,22 @@ impl Worker {
                         if !latest.contains_key(&next.id) {
                             pending.push(next.id.clone());
                         }
-                        let refill = latest.get(&next.id).is_some_and(|r| r.refill_images);
+                        let refill = latest.get(&next.id).is_some_and(|r| r.source.refill_images());
                         let mut next = next;
-                        next.refill_images |= refill;
+                        if let Source::Draft { refill_images, .. } = &mut next.source {
+                            *refill_images |= refill;
+                        }
                         latest.insert(next.id.clone(), next);
                     }
                     for id in pending {
                         let Some(job) = latest.remove(&id) else { continue };
-                        let result = pipeline::rebuild(&rb_library, &job.id, &job.draft, job.refill_images)
+                        let rebuilt = match &job.source {
+                            Source::Draft { draft, refill_images } => {
+                                pipeline::rebuild(&rb_library, &job.id, draft, *refill_images)
+                            }
+                            Source::Edition(e) => edition::rebuild(&rb_library, &job.id, e),
+                        };
+                        let result = rebuilt
                             .map(|rebuilt| {
                                 let pages = (0..rebuilt.compiled.page_count().min(PREVIEW_PAGES))
                                     .filter_map(|i| typeset::render_page(&rebuilt.compiled.document, i, PREVIEW_DPI))
@@ -200,6 +229,13 @@ fn process(request: Request, library: &Library, events: &Sender<Event>, ctx: &eg
             send(Event::Progress { job, stage: format!("Sending to {printer}…") });
             match pipeline::print_entry(library, &id, &settings, &PrintTarget::default()) {
                 Ok(record) => send(Event::Printed { job, record }),
+                Err(err) => send(Event::Failed { job, error: format!("{err:#}") }),
+            }
+        }
+        Request::CreateEdition { job, ids, settings } => {
+            send(Event::Progress { job, stage: format!("Laying out {} stories in columns…", ids.len()) });
+            match edition::create(library, edition::new_from_settings(&ids, &settings)) {
+                Ok(rebuilt) => send(Event::Added { job, entry: Box::new(rebuilt.entry) }),
                 Err(err) => send(Event::Failed { job, error: format!("{err:#}") }),
             }
         }

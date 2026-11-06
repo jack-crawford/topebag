@@ -368,8 +368,8 @@ pub fn print_entry(library: &Library, id: &str, settings: &Settings, target: &Pr
 /// one). Nothing is written until the draft is rebuilt.
 pub fn load_draft(library: &Library, id: &str, defaults: &Format) -> Result<Option<Draft>> {
     let entry = library.entry(id)?;
-    if entry.kind == EntryKind::Pdf {
-        return Ok(None);
+    if entry.kind != EntryKind::Article {
+        return Ok(None); // PDFs print as they are; editions have their own model
     }
     let path = library.draft_path(id)?;
     if path.exists() {
@@ -400,7 +400,7 @@ pub struct Rebuilt {
 pub fn rebuild(library: &Library, id: &str, draft: &Draft, refill_images: bool) -> Result<Rebuilt> {
     let mut entry = library.entry(id)?;
     let dir = library.dir(id)?;
-    if entry.kind == EntryKind::Pdf {
+    if entry.kind != EntryKind::Article {
         let compiled = typeset::compile_dir(&dir)?;
         return Ok(Rebuilt { entry, compiled });
     }
@@ -443,6 +443,10 @@ impl ImageResolver for OfflineImages<'_, '_> {
 /// Rebuild a saved document from its draft (making one with `settings`'
 /// formatting if it has none), downloading any missing images.
 pub fn retypeset(library: &Library, id: &str, settings: &Settings) -> Result<Entry> {
+    if library.entry(id)?.kind == EntryKind::Edition {
+        let edition = crate::edition::Edition::load(&library.dir(id)?.join("edition.json"))?;
+        return Ok(crate::edition::rebuild(library, id, &edition)?.entry);
+    }
     match load_draft(library, id, &settings.format)? {
         Some(draft) => Ok(rebuild(library, id, &draft, true)?.entry),
         None => library.entry(id), // PDFs print as they are
@@ -507,6 +511,7 @@ fn convert_body(
         include_images: format.include_images,
         title: Some(entry.title.clone()),
         strip_chrome: entry.used_fallback,
+        allow_floats: true,
     };
     convert::html_to_typst(html, base, &options, images)
 }
@@ -557,7 +562,7 @@ fn build(dir: &Path, entry: &Entry, format: &Format, body: &str, html: &str) -> 
     }
 }
 
-fn write_pdf(dir: &Path, compiled: &Compiled) -> Result<()> {
+pub(crate) fn write_pdf(dir: &Path, compiled: &Compiled) -> Result<()> {
     let bytes = typeset::pdf(&compiled.document)?;
     let tmp = dir.join("document.pdf.tmp");
     fs::write(&tmp, bytes)?;

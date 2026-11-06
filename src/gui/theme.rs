@@ -91,8 +91,51 @@ fn install_fonts(ctx: &egui::Context) {
         }
     }
 
+    if cfg!(target_os = "macos") {
+        add_mac_fonts(&mut fonts, &mut bold_stack);
+    }
+
     fonts.families.insert(bold_family(), bold_stack);
     ctx.set_fonts(fonts);
+}
+
+/// macOS: Helvetica Neue for text (the regular and bold faces picked out of
+/// the system's font collection) and Apple Symbols for arrows, ticks and ⌘.
+/// Compiled on every platform so it's type-checked and tested everywhere;
+/// elsewhere the files simply don't exist.
+fn add_mac_fonts(fonts: &mut FontDefinitions, bold_stack: &mut Vec<String>) {
+    if let Ok(data) = std::fs::read("/System/Library/Fonts/HelveticaNeue.ttc") {
+        if let Some(index) = face_index(&data, 700) {
+            let mut bold = FontData::from_owned(data.clone());
+            bold.index = index;
+            fonts.font_data.insert("helvetica-bold".into(), bold.into());
+            bold_stack.insert(0, "helvetica-bold".into());
+        }
+        if let Some(index) = face_index(&data, 400) {
+            let mut regular = FontData::from_owned(data);
+            regular.index = index;
+            fonts.font_data.insert("helvetica".into(), regular.into());
+            fonts.families.entry(FontFamily::Proportional).or_default().insert(0, "helvetica".into());
+        }
+    }
+    if let Ok(symbols) = std::fs::read("/System/Library/Fonts/Apple Symbols.ttf") {
+        fonts.font_data.insert("apple-symbols".into(), FontData::from_owned(symbols).into());
+        fonts.families.entry(FontFamily::Proportional).or_default().push("apple-symbols".into());
+        bold_stack.push("apple-symbols".into());
+    }
+}
+
+/// Index of the upright, normal-width face of `weight` (400 regular, 700
+/// bold) in a font file or collection.
+fn face_index(data: &[u8], weight: u16) -> Option<u32> {
+    use typst::text::{FontInfo, FontStretch, FontStyle};
+    FontInfo::iter(data)
+        .position(|info| {
+            info.variant.weight.to_number() == weight
+                && info.variant.style == FontStyle::Normal
+                && info.variant.stretch == FontStretch::NORMAL
+        })
+        .and_then(|i| u32::try_from(i).ok())
 }
 
 /// A 64×64 window icon: an orange tote with a white printed page.
@@ -136,4 +179,36 @@ pub fn icon() -> egui::IconData {
         }
     }
     egui::IconData { rgba, width: S as u32, height: S as u32 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn faces_are_found_by_weight() {
+        let regular = typst_assets::fonts()
+            .find(|data| {
+                typst::text::FontInfo::iter(data)
+                    .next()
+                    .is_some_and(|i| i.family == "Libertinus Serif" && i.variant.weight.to_number() == 400 && i.variant.style == typst::text::FontStyle::Normal)
+            })
+            .expect("Libertinus Serif Regular is bundled");
+        assert_eq!(face_index(regular, 400), Some(0));
+        assert_eq!(face_index(regular, 700), None);
+    }
+
+    #[test]
+    fn mac_fonts_are_skipped_where_missing() {
+        let mut fonts = FontDefinitions::default();
+        let mut bold = Vec::new();
+        add_mac_fonts(&mut fonts, &mut bold);
+        if cfg!(target_os = "macos") {
+            // On a Mac (CI runs one) the system fonts are really picked up.
+            assert!(fonts.font_data.contains_key("helvetica") && fonts.font_data.contains_key("helvetica-bold"));
+            assert_eq!(bold.first().map(String::as_str), Some("helvetica-bold"));
+        } else {
+            assert!(bold.is_empty() && !fonts.font_data.contains_key("helvetica"));
+        }
+    }
 }

@@ -39,11 +39,14 @@ pub struct ConvertOptions {
     /// Also drop page chrome (`header`, `footer`, `aside`). Used when
     /// Readability failed and the whole page body is being converted.
     pub strip_chrome: bool,
+    /// Let top-level figures float to the top or bottom of a page. Editions
+    /// turn this off so pictures stay inside their own story.
+    pub allow_floats: bool,
 }
 
 impl Default for ConvertOptions {
     fn default() -> Self {
-        Self { link_style: LinkStyle::Plain, include_images: true, title: None, strip_chrome: false }
+        Self { link_style: LinkStyle::Plain, include_images: true, title: None, strip_chrome: false, allow_floats: true }
     }
 }
 
@@ -519,7 +522,7 @@ impl Converter<'_> {
         // Top-level figures float to the top/bottom of a page (like in a
         // book), which avoids half-empty pages before tall images. Figures
         // inside lists, tables or quotes stay where they are.
-        let float = if self.depth == 0 { ", float: true" } else { "" };
+        let float = if self.depth == 0 && self.options.allow_floats { ", float: true" } else { "" };
         let (width, height) = display_size(el, stored.width, stored.height);
         Some(format!(
             "#tb-figure({}, {}, {}{caption}{float})",

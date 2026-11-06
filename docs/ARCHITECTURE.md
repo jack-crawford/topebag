@@ -108,6 +108,7 @@ apart.
 | `extract.rs` | Reader mode | `extract` → `Article` |
 | `images.rs` | Image pipeline | `ImageResolver`, `Downloader`, `StoredImages`, `NoImages` |
 | `document.rs` | Editable drafts | `Draft`, `Block`, `BlockKind`, `split_blocks`, `html_to_markdown`, `markdown_to_html` |
+| `edition.rs` | Newspaper-style editions | `Edition`, `Member`, `create`, `rebuild`, `is_stale`, `can_join` |
 | `convert.rs` | HTML → Typst | `html_to_typst`, `html_to_plain_typst`, `escape_text`, `string_literal` |
 | `typeset.rs` | Typst integration | `main_source`, `compile`, `pdf`, `render_page`, fonts and `World` |
 | `library.rs` | Storage | `Library`, `Entry`, `PrintRecord`, `data_dir` |
@@ -115,12 +116,12 @@ apart.
 | `instapaper.rs` | Reading-queue feeds | `parse_feed`, `fetch_feed`, `QueueState` (`observe`, `unseen`, `mark_seen`) |
 | `search.rs` | Library search | `parse_query`, `SearchIndex::matches` → `Hit` with snippet |
 | `instance.rs` | Single instance | `claim` → `Role::{Primary, Secondary}`, `Primary::listen` |
-| `autostart.rs` | Start with Windows | `set_enabled`, `is_enabled` (per-user `Run` key) |
+| `autostart.rs` | Start at sign-in | `set_enabled`, `is_enabled` (Windows `Run` key; macOS `launch_agent`) |
 | `print/` | Printing | `printers`, `default_printer`, `print` (Windows GDI / CUPS) |
 | `settings.rs` | Preferences | `Settings`, per-document `Format`, enums |
 | `main.rs`, `cli.rs` | Executable | GUI by default; subcommands for the CLI |
-| `gui/` | Desktop app | `App` (UI state), `worker` (threads), `tray`, `theme` |
-| `assets/topebag.typ` | Document template | `tb-article`, `tb-figure`, `tb-table`, … |
+| `gui/` | Desktop app | `App` (UI state), `worker` (threads), `keys` (keyboard shortcuts), `tray`, `theme` |
+| `assets/topebag.typ` | Document template | `tb-base` (shared type styles), `tb-article`, `tb-edition`, `tb-story`, `tb-figure`, `tb-table`, … |
 
 ## Key design decisions
 
@@ -190,6 +191,18 @@ blocks becomes its own paragraph block. A paragraph or wrapper holding only
 an image is an image block, and empty blocks are dropped. Each block keeps
 its original HTML and a stable `id`.
 
+**Sections.** Headings give the flat block list a hierarchy without storing
+one: `Draft::section(i)` is a heading plus everything up to the next heading
+of the same or a higher level (any other block is its own section), and
+`Draft::depths()` gives each block's nesting for indentation. A heading's
+checkbox calls `set_section_included`, and `section_inclusion` reports
+`All`, `Partly` (shown as a dash) or `Nothing`. `move_section` rotates a
+heading's section past the neighbouring section of the same level (or past
+one block when there's none), so ↑ ↓ on a heading keep its contents with it.
+Because the hierarchy is derived from heading levels every time, it can't go
+stale after edits or moves. Folding is purely a view: the GUI keeps folded
+heading ids per document in memory, and `section` decides what to hide.
+
 A block can be **excluded**, **moved**, or **edited**. Edits round-trip
 through light Markdown: `html_to_markdown` turns the block's inline HTML into
 `**bold**`, `*italic*`, `` `code` ``, `[link](url)` (lists become `- item`
@@ -247,10 +260,76 @@ is "fewest sheets, then least tightening". Typst's incremental compilation
 keeps this cheap: about 0.3 s for a newsletter article, 0.7 s for a 19-page
 essay, and 4.6 s for a 146-page book.
 
+**Reuse**: the search lives in `typeset::fit_density(make_source, root, fit)`,
+which takes any "density → Typst source" function. Articles and editions
+both use it.
+
 **Printing**: printers default to portrait, so `print/windows.rs` turns any
 page whose orientation differs from the paper's a quarter turn
 counter-clockwise (`rotate_ccw`) before blitting. Landscape PDF links
 benefit too.
+
+### Editions: newspaper-style batches
+
+Printing articles one at a time wastes the end of every last page. An
+edition (`edition.rs`) is a library entry of kind `Edition` whose stories flow
+through **one** column layout, so the only blank space is at the very end.
+
+**Model.** `edition.json` holds an `Edition`: the nameplate title, the
+ordered `members` (article id plus an `included` flag), whether page 1 lists
+the contents, and its own `Format` (three columns, 9.5 pt and fit-to-pages by
+default; `side_by_side` is ignored). Only `EntryKind::Article` entries can
+join (`can_join`), since PDFs can't be reflowed. `create` drops the others,
+saves the entry and lays it out, and removes the half-made entry if layout
+fails.
+
+**Building** (`edition::rebuild`). For each included member, it loads the
+article's **current draft** with `pipeline::load_draft` (edits, dropped
+blocks and a changed title all carry over) and removes a short byline
+paragraph near the top that the story header would repeat. It then converts
+with `ConvertOptions { allow_floats: false, … }`, so figures stay inside
+their story instead of floating to the top of a page that belongs to
+another. Images go through a `CopyImages` resolver that copies each stored
+image to `img/<story>-<file>`, so the edition is self-contained and still
+prints after an article is deleted (that story is skipped with a warning).
+Each story becomes one `#tb-story(title:, site:, byline:, date:, minutes:,
+qr:, first:, lang:, region:)[body]` call, and `main.typ` wraps them all in
+`#show: tb-edition.with(...)`. Layout goes through the same `fit_density`
+search as spreads, minimising **pages** instead of sheets. The entry's title
+(`<nameplate> · <date>`), page count, density and warnings are updated, and
+`article.txt` gets the story titles for search.
+
+**Template** (`assets/topebag.typ`). `tb-base` holds the type styles shared
+with articles (text, paragraphs, headings, code, quotes, tables, lists), so
+an edition sets type exactly like a single article at the same density.
+`tb-edition` sets up the page (running head from page 2, page numbers,
+hairlines between columns drawn in the page `background`) and places the
+**nameplate** as a top float spanning all columns (`scope: "parent"`):
+heavy rule, title, dateline, story count and reading time, and the "In this
+edition" line. That line is built in `context` by querying the `metadata`
+marker each story emits, so its page numbers are always right.
+`tb-story` emits that marker and then one **sticky, unbreakable header
+block** (separator rule, kicker, headline, details, optional QR). Because it's
+sticky, it moves to the next column together with the story's first lines
+rather than sitting alone at a column's foot. The rule lives inside the same
+block on purpose: Typst doesn't chain two sticky blocks. The body follows
+directly in the column flow, with no container, so a story can break across
+columns and pages anywhere, and headings inside a story are scaled down to
+stay below its headline.
+
+**Staleness.** `is_stale` compares the edition's `document.pdf` timestamp
+with its stories' `document.json`. The GUI highlights **Update from
+articles** when an article was edited after the edition was laid out.
+
+**GUI.** The library keeps an ordered `picked` list next to the open
+document. Ctrl+click toggles (starting from the open document, like a file
+manager), Shift+click adds a range in display order, and **Select** mode
+turns plain clicks into toggles. A batch bar offers **Combine into an
+edition** (`Request::CreateEdition` on the job thread, reported as
+`Event::Added`) or **Add to "…"** for the open edition. The editor's
+`Editor::source()` yields either `Source::Draft` or `Source::Edition`, so the
+debounced rebuild thread, the latest-wins coalescing and the live preview
+work the same for both.
 
 ### Printing by rasterising
 
@@ -358,7 +437,8 @@ deleted.
 - **Start with Windows** (`autostart.rs`): one `REG_SZ` value under
   `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` that runs
   `topebag.exe gui --background`. No admin rights, and it's removed when the
-  setting is turned off.
+  setting is turned off. On macOS the same setting writes a LaunchAgent
+  plist (`launch_agent`) instead.
 
 ### Threads in the GUI
 
@@ -375,6 +455,25 @@ The egui UI thread never blocks:
 - Results come back as `Event`s over a channel. Each send calls
   `request_repaint()`, so the UI wakes up and applies them in
   `App::poll_events`.
+
+### Keyboard
+
+`gui/keys.rs` decodes each frame's key presses into `Command`s (`keys::read`)
+and `App::run_command` carries them out, so the decoding is tested against a
+bare `egui::Context` without any UI. Three rules keep shortcuts from fighting
+egui. First, while a text field has focus (or had it last frame, so the Esc
+that leaves a field doesn't also untick the library), only Ctrl shortcuts and
+F-keys are read. Second, after Tab focuses a widget, arrows and Space are left
+to egui's own widget navigation. Third, an open confirmation dialog gets every
+key: Enter confirms (only after the dialog has been on screen for a frame, so
+the key press that opened it can't confirm it too), and Esc cancels through
+`Modal::should_close`. Shifted bindings are checked before plain ones because
+egui's `consume_key` ignores an extra Shift. The same `keys::GROUPS` table
+drives the F1 window, so the help can't drift from the bindings.
+
+Moving through the library opens each document, but its preview starts only
+after a 150 ms pause (`preview_due`), so holding ↓ doesn't start a render for
+every entry passed.
 
 ### Errors and resilience
 
@@ -409,6 +508,35 @@ Teach `fetch::fetch_page` to return the content type, then branch in
 **Add a print backend.** Implement `printers`, `default_printer` and `print`
 in a new `print/` submodule and select it with `cfg` in `print/mod.rs`.
 
+## Portability (Windows and macOS)
+
+Everything platform-specific is behind `cfg` in a few places:
+
+| Concern | Windows | macOS (and Linux) |
+|---|---|---|
+| Printing | `print/windows.rs`: GDI, rasterised pages | `print/cups.rs`: the PDF goes to `lp`; `lpstat` lists printers |
+| Start at sign-in | Registry `Run` value | LaunchAgent plist (Linux: not supported) |
+| Tray icon | `tray-icon` (a Windows-only dependency) | None yet, so closing the window quits |
+| System fonts (PDFs) | Segoe UI, Georgia, Consolas, symbols, CJK | Helvetica Neue, Georgia, Menlo, Apple Symbols, Hiragino, Apple SD Gothic Neo, Arial Unicode |
+| UI fonts | Segoe UI | Helvetica Neue (faces picked from the `.ttc` by weight) and Apple Symbols |
+| Paper default | Locale API | `LC_PAPER`/`LANG`, else the macOS `AppleLocale` setting |
+| Browser for JS pages | Edge, Chrome under Program Files | Edge, Chrome in `/Applications` |
+| Data folder | `%LOCALAPPDATA%\Topebag` | `~/Library/Application Support/Topebag` |
+| Shortcut labels | Ctrl | `keys::display` turns Ctrl+ into ⌘ (egui's COMMAND modifier is ⌘ on a Mac) |
+
+The template lists Windows and macOS families side by side (for example
+`("Segoe UI", "Helvetica Neue", "Arial", …)`), and Typst uses the first one
+installed. Its "unknown font family" warnings for the others are filtered
+out before they reach the UI. Body text and code use fonts compiled in from
+`typst-assets`, so documents look the same on both systems.
+
+Code that only runs on a Mac can't be type-checked from Windows. So the Mac
+logic lives in ordinary functions compiled everywhere (`launch_agent::*`,
+`add_mac_fonts`, `face_index`, `Paper::for_locale`, `keys::display`) and is
+unit-tested on every platform. Only one-line dispatches sit behind
+`#[cfg(...)]`. `.github/workflows/ci.yml` then builds and runs the whole test
+suite on `macos-latest` and `windows-latest` for every push.
+
 ## Testing
 
 - **Unit tests** sit next to the code (`cargo test`). They cover escaping,
@@ -430,6 +558,19 @@ in a new `print/` submodule and select it with `cfg` in `print/mod.rs`.
   and an end-to-end flow: add → drop blocks → rewrite and move a heading →
   rename → rebuild (checking the Typst, the library title and the search
   text) → refill missing images → per-document grayscale → restore original.
+- **Edition tests** check that three stories in columns take fewer pages than
+  printed separately and still compile in one and two columns; that a PDF is
+  skipped; that the stories keep the picked order and their images are copied
+  in; that no figure floats; preview and search text; staleness after an
+  article edit; reordering, leaving out and renaming; the CLI re-typeset
+  path; a deleted article turning into a note; and that a byline repeated in
+  the body is dropped (but a sentence starting with "By" isn't).
+- **Section and keyboard tests** cover section ranges, depths, inclusion
+  states and section moves (past siblings, out of a parent, at the edges);
+  library moves at the ends and with nothing open; ranges in either
+  direction; and key decoding: Shift before plain, Ctrl shortcuts while
+  typing, and plain keys left alone while typing, with a widget focused, or
+  with a window or dialog open.
 - **Spread tests** check that side-by-side sheets are landscape, that the
   optimizer reaches the compact sheet count with near-minimal tightening
   (and leaves one-sheet articles alone), that re-typesetting switches between

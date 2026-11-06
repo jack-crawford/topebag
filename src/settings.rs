@@ -77,16 +77,23 @@ impl Paper {
         }
         #[cfg(not(windows))]
         {
-            // Rough heuristic: the US and Canada use Letter, everyone else A4.
-            let lang = std::env::var("LC_PAPER")
-                .or_else(|_| std::env::var("LANG"))
-                .unwrap_or_default();
-            if lang.contains("_US") || lang.contains("_CA") {
-                Paper::Letter
-            } else {
-                Paper::A4
-            }
+            // Apps opened from the Finder have no LANG, so macOS asks the
+            // system locale instead (once; it runs `defaults`).
+            static PAPER: std::sync::OnceLock<Paper> = std::sync::OnceLock::new();
+            *PAPER.get_or_init(|| {
+                let env = std::env::var("LC_PAPER").or_else(|_| std::env::var("LANG")).ok();
+                let locale = env.filter(|l| !l.is_empty()).or_else(|| if cfg!(target_os = "macos") { apple_locale() } else { None });
+                Paper::for_locale(&locale.unwrap_or_default())
+            })
         }
+    }
+
+    /// Letter in the US, Canada, Mexico and the Philippines; A4 elsewhere.
+    /// Takes `en_US.UTF-8`, `en_US` or `en-US`.
+    pub fn for_locale(locale: &str) -> Paper {
+        let region = locale.split('.').next().unwrap_or("").rsplit(['_', '-']).next().unwrap_or("");
+        let has_region = locale.contains(['_', '-']);
+        if has_region && matches!(region, "US" | "CA" | "MX" | "PH") { Paper::Letter } else { Paper::A4 }
     }
 }
 
@@ -192,7 +199,7 @@ pub struct Format {
     pub font_size: f32,
     /// Body typeface.
     pub typeface: Typeface,
-    /// Number of text columns (1 or 2). Not used with side-by-side spreads.
+    /// Number of text columns (1–3). Not used with side-by-side spreads.
     pub columns: u8,
     /// Justify paragraphs (with hyphenation) instead of ragged-right.
     pub justify: bool,
@@ -209,6 +216,14 @@ pub struct Format {
     pub link_style: LinkStyle,
     /// Print a QR code linking back to the original page in the header.
     pub qr_code: bool,
+}
+
+/// The macOS region setting, e.g. `en_US`.
+#[cfg_attr(windows, allow(dead_code))]
+fn apple_locale() -> Option<String> {
+    let out = std::process::Command::new("defaults").args(["read", "-g", "AppleLocale"]).output().ok()?;
+    let locale = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !locale.is_empty()).then_some(locale)
 }
 
 impl Default for Format {
@@ -232,7 +247,7 @@ impl Default for Format {
 impl Format {
     /// Clamp values into supported ranges.
     pub fn sanitize(&mut self) {
-        self.columns = self.columns.clamp(1, 2);
+        self.columns = self.columns.clamp(1, 3);
         if !self.font_size.is_finite() {
             self.font_size = 11.0;
         }
@@ -349,13 +364,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn paper_follows_the_region() {
+        assert_eq!(Paper::for_locale("en_US.UTF-8"), Paper::Letter);
+        assert_eq!(Paper::for_locale("en_CA"), Paper::Letter);
+        assert_eq!(Paper::for_locale("es-MX"), Paper::Letter);
+        assert_eq!(Paper::for_locale("en_GB.UTF-8"), Paper::A4);
+        assert_eq!(Paper::for_locale("de_DE"), Paper::A4);
+        assert_eq!(Paper::for_locale(""), Paper::A4);
+        assert_eq!(Paper::for_locale("US"), Paper::A4, "a bare word isn't a region");
+    }
+
+    #[test]
     fn roundtrip_and_defaults_for_missing_fields() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("settings.json");
         fs::write(&path, r#"{ "copies": 3, "columns": 9 }"#).unwrap();
         let s = Settings::load(&path).unwrap();
         assert_eq!(s.copies, 3);
-        assert_eq!(s.format.columns, 2, "columns are clamped (and read from the flat file)");
+        assert_eq!(s.format.columns, 3, "columns are clamped (and read from the flat file)");
         assert!(s.format.include_images, "missing fields use defaults");
 
         s.save(&path).unwrap();

@@ -10,6 +10,7 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use topebag::edition;
 use topebag::instapaper::{self, QueueState};
 use topebag::library::{self, Library};
 use topebag::pipeline::{self, PrintTarget, Stage};
@@ -25,7 +26,7 @@ use topebag::{browser, fetch, print};
     long_about = "Topebag turns web articles into print-friendly PDFs, keeps them in a local \
                   library and sends them to your printer.\n\nRun without a command to open the \
                   desktop app.",
-    after_help = "Data lives in %LOCALAPPDATA%\\Topebag (override with TOPEBAG_HOME)."
+    after_help = "Data lives in your user data folder (`topebag info` shows where; override with TOPEBAG_HOME)."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -53,7 +54,7 @@ pub enum Command {
         /// Printer to use (implies --print; defaults to settings, then the system default).
         #[arg(long)]
         printer: Option<String>,
-        /// Print to a file instead of paper (uses "Microsoft Print to PDF" on Windows).
+        /// Print to a file instead of paper ("Microsoft Print to PDF" on Windows; a copy of the PDF elsewhere).
         #[arg(long, value_name = "FILE")]
         print_to_file: Option<PathBuf>,
         /// Lay out two pages side by side on each sheet (overrides settings).
@@ -80,6 +81,33 @@ pub enum Command {
         /// Switch this document back to one page per sheet.
         #[arg(long)]
         one_page: bool,
+    },
+    /// Combine saved articles into one newspaper-style edition: the stories
+    /// run on one after another through shared columns, so no page ends half
+    /// empty. Prints the new edition's id; print it with `topebag print`.
+    Edition {
+        /// Article ids in print order (see `topebag list`). PDFs are skipped.
+        #[arg(required = true)]
+        ids: Vec<String>,
+        /// Nameplate at the top of page 1 (default "The Topebag").
+        #[arg(long)]
+        title: Option<String>,
+        /// Number of columns.
+        #[arg(long, value_parser = clap::value_parser!(u8).range(1..=3))]
+        columns: Option<u8>,
+        /// Leave out the "In this edition" list on page 1.
+        #[arg(long)]
+        no_contents: bool,
+        /// Keep normal spacing instead of tightening it to save a page.
+        #[arg(long)]
+        no_fit: bool,
+        /// Also print the edition.
+        #[arg(long)]
+        print: bool,
+        #[arg(long)]
+        printer: Option<String>,
+        #[arg(long, value_name = "FILE")]
+        print_to_file: Option<PathBuf>,
     },
     /// List saved documents, newest first.
     List,
@@ -214,6 +242,9 @@ fn execute(command: Command) -> Result<()> {
         }
         Command::Retypeset { id, side_by_side, one_page } => {
             let entry = match pipeline::load_draft(&library, &id, &settings.format)? {
+                _ if library.entry(&id)?.kind == library::EntryKind::Edition => {
+                    pipeline::retypeset(&library, &id, &settings)?
+                }
                 Some(mut draft) => {
                     if side_by_side || one_page {
                         draft.format.side_by_side = side_by_side;
@@ -233,6 +264,36 @@ fn execute(command: Command) -> Result<()> {
                 println!("re-typeset \"{}\" — {} page(s)", entry.title, entry.pages);
             }
         }
+        Command::Edition { ids, title, columns, no_contents, no_fit, print, printer, print_to_file } => {
+            for id in &ids {
+                let entry = library.entry(id)?;
+                if !edition::can_join(&entry) {
+                    println!("note: skipping \"{}\": only web articles can flow into columns", entry.title);
+                }
+            }
+            let mut ed = edition::new_from_settings(&ids, &settings);
+            if let Some(title) = title {
+                ed.title = title;
+            }
+            if let Some(columns) = columns {
+                ed.format.columns = columns;
+            }
+            ed.contents = !no_contents;
+            ed.format.fit_to_sheets = !no_fit;
+            let rebuilt = edition::create(&library, ed)?;
+            let e = &rebuilt.entry;
+            let tightened = if e.density > 0.005 { format!(", spacing tightened {:.0}%", e.density * 100.0) } else { String::new() };
+            println!("✓ \"{}\": {} on {} page(s){tightened}, saved as {}", e.title, e.site_name.as_deref().unwrap_or(""), e.pages, e.id);
+            println!("  {}", library.pdf_path(&e.id)?.display());
+            for w in &e.warnings {
+                println!("  note: {w}");
+            }
+            let target = print_target(printer, print_to_file)?;
+            if print || target.output_file.is_some() || target.printer.is_some() {
+                let rec = pipeline::print_entry(&library, &e.id, &settings, &target)?;
+                println!("  printed {} sheet(s) on {}", rec.pages, rec.printer);
+            }
+        }
         Command::List => {
             let entries = library.entries()?;
             if entries.is_empty() {
@@ -244,7 +305,11 @@ fn execute(command: Command) -> Result<()> {
                     n => format!("printed ×{n}"),
                 };
                 let tags = if e.tags.is_empty() { String::new() } else { format!(" · #{}", e.tags.join(" #")) };
-                let kind = if e.kind == library::EntryKind::Pdf { " · PDF" } else { "" };
+                let kind = match e.kind {
+                    library::EntryKind::Pdf => " · PDF",
+                    library::EntryKind::Edition => " · edition",
+                    library::EntryKind::Article => "",
+                };
                 println!("{}\n    {} · {} · {} page(s){kind} · {printed}{tags}", e.id, e.title, e.domain(), e.pages);
             }
         }
@@ -289,7 +354,6 @@ fn execute(command: Command) -> Result<()> {
                 println!("Marked {} item(s) as handled.", queue.len());
             } else if fetch_all {
                 let target = PrintTarget::default();
-                let print = print;
                 for item in &queue {
                     println!("→ {}", item.title);
                     let url = fetch::parse_url(&item.url)?;

@@ -10,8 +10,10 @@ use std::sync::mpsc::Sender;
 
 use eframe::egui;
 
-/// Something the user asked for from the tray.
+/// Something the user asked for from the tray. (Only the Windows tray
+/// sends these; elsewhere the receiving end simply never hears from it.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
 pub enum TrayAction {
     Open,
     PrintClipboard,
@@ -88,6 +90,7 @@ mod imp {
 mod imp {
     use super::*;
 
+    #[allow(dead_code)] // never built: `create` always fails here
     pub struct Tray;
 
     pub fn create(_ctx: egui::Context, _tx: Sender<TrayAction>) -> anyhow::Result<Tray> {

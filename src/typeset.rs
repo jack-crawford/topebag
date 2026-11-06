@@ -140,7 +140,7 @@ pub fn main_source(meta: &DocMeta, format: &Format, body: &str, density: f64) ->
             Typeface::Serif => "serif",
             Typeface::Sans => "sans",
         }),
-        cols = format.columns.clamp(1, 2),
+        cols = format.columns.clamp(1, 3),
         justify = format.justify,
         qr = if meta.has_qr { "\"/qr.svg\"" } else { "none" },
         spread = format.side_by_side,
@@ -149,7 +149,7 @@ pub fn main_source(meta: &DocMeta, format: &Format, body: &str, density: f64) ->
 }
 
 /// Split `en-GB` into Typst's `lang: "en", region: "GB"`.
-fn split_lang(tag: Option<&str>) -> (String, Option<String>) {
+pub(crate) fn split_lang(tag: Option<&str>) -> (String, Option<String>) {
     let tag = tag.unwrap_or("en").trim();
     let mut parts = tag.split(['-', '_']);
     let lang = parts.next().unwrap_or("en").to_ascii_lowercase();
@@ -257,14 +257,21 @@ const FIT_BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
 /// So a 3-sheet article that can squeeze onto 2 sheets is tightened just
 /// enough, while one that saves nothing keeps its normal spacing.
 pub fn compile_fitted(meta: &DocMeta, format: &Format, body: &str, root: &Path) -> Result<Fitted> {
+    fit_density(|density| main_source(meta, format, body, density), root, format.side_by_side && format.fit_to_sheets)
+}
+
+/// The search behind [`compile_fitted`], for any document whose source is a
+/// function of density (articles and editions). With `fit` false it just
+/// lays out at normal spacing.
+pub fn fit_density(make_source: impl Fn(f64) -> String, root: &Path, fit: bool) -> Result<Fitted> {
     let attempt = |density: f64| -> Result<Fitted> {
-        let source = main_source(meta, format, body, density);
+        let source = make_source(density);
         let compiled = compile(&source, root)?;
         Ok(Fitted { compiled, source, density })
     };
 
     let relaxed = attempt(0.0)?;
-    if !(format.side_by_side && format.fit_to_sheets) || relaxed.compiled.page_count() <= 1 {
+    if !fit || relaxed.compiled.page_count() <= 1 {
         return Ok(relaxed);
     }
     let started = std::time::Instant::now();
@@ -570,6 +577,46 @@ fn fonts() -> &'static FontStore {
     })
 }
 
+/// macOS system fonts matching the Windows set: Helvetica Neue (sans),
+/// Georgia (serif), Menlo (mono), Apple Symbols, and CJK, Korean and
+/// Devanagari coverage. Apple Color Emoji is left out on purpose: it's a
+/// ~180 MB file, read in full just to index it.
+#[cfg_attr(windows, allow(dead_code))]
+const MAC_FONTS: &[&str] = &[
+    "/System/Library/Fonts/HelveticaNeue.ttc",
+    "/System/Library/Fonts/Menlo.ttc",
+    "/System/Library/Fonts/Apple Symbols.ttf",
+    "/System/Library/Fonts/Hiragino Sans GB.ttc",
+    "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
+    "/System/Library/Fonts/ヒラギノ角ゴシック W6.ttc",
+    "/System/Library/Fonts/AppleSDGothicNeo.ttc",
+    "/System/Library/Fonts/Kohinoor.ttc",
+    "/System/Library/Fonts/Supplemental/Georgia.ttf",
+    "/System/Library/Fonts/Supplemental/Georgia Bold.ttf",
+    "/System/Library/Fonts/Supplemental/Georgia Italic.ttf",
+    "/System/Library/Fonts/Supplemental/Georgia Bold Italic.ttf",
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
+    "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+    "/System/Library/Fonts/Supplemental/Arial Italic.ttf",
+    "/System/Library/Fonts/Supplemental/Arial Bold Italic.ttf",
+    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+];
+
+/// Common Linux font locations.
+#[cfg_attr(windows, allow(dead_code))]
+const LINUX_FONTS: &[&str] = &[
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSerif-Bold.ttf",
+];
+
+/// The paths in `candidates` that exist on this machine.
+#[cfg_attr(windows, allow(dead_code))]
+fn existing(candidates: &[&str]) -> Vec<PathBuf> {
+    candidates.iter().map(PathBuf::from).filter(|p| p.exists()).collect()
+}
+
 fn system_font_paths() -> Vec<PathBuf> {
     #[cfg(windows)]
     {
@@ -579,13 +626,7 @@ fn system_font_paths() -> Vec<PathBuf> {
     }
     #[cfg(not(windows))]
     {
-        let candidates = [
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-            "/System/Library/Fonts/Helvetica.ttc",
-            "/System/Library/Fonts/Supplemental/Arial.ttf",
-        ];
-        candidates.iter().map(PathBuf::from).filter(|p| p.exists()).collect()
+        existing(if cfg!(target_os = "macos") { MAC_FONTS } else { LINUX_FONTS })
     }
 }
 
@@ -599,6 +640,19 @@ pub fn warm_up() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_template_sans_resolves_to_a_system_font() {
+        // The template asks for Segoe UI, then Helvetica Neue: one of them is
+        // installed on each desktop system (CI checks both).
+        let book = &fonts().book;
+        if cfg!(windows) {
+            assert!(book.contains_family("segoe ui"));
+        } else if cfg!(target_os = "macos") {
+            assert!(book.contains_family("helvetica neue") && book.contains_family("georgia"));
+        }
+        assert!(existing(&["/definitely/not/a/font.ttf"]).is_empty());
+    }
 
     fn sample_main(body: &str) -> String {
         let meta = DocMeta {

@@ -69,6 +69,8 @@ pub enum EntryKind {
     Article,
     /// A PDF downloaded as-is (printed page by page).
     Pdf,
+    /// Several articles printed together, newspaper style.
+    Edition,
 }
 
 /// Metadata for one saved document.
@@ -217,7 +219,7 @@ impl Library {
                 Err(err) => log::warn!("ignoring unreadable entry {}: {err:#}", meta.display()),
             }
         }
-        entries.sort_by(|a, b| b.saved_at.cmp(&a.saved_at));
+        entries.sort_by_key(|e| std::cmp::Reverse(e.saved_at));
         Ok(entries)
     }
 

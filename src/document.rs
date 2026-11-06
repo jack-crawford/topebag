@@ -18,6 +18,7 @@
 //! code and links survive an edit.
 
 use std::fs;
+use std::ops::Range;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -71,6 +72,14 @@ impl BlockKind {
 
 fn yes() -> bool {
     true
+}
+
+/// How much of a heading's section is printed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Inclusion {
+    All,
+    Partly,
+    Nothing,
 }
 
 /// One block of an article.
@@ -172,6 +181,92 @@ impl Draft {
                 t
             }
             _ => index,
+        }
+    }
+
+    fn level(&self, index: usize) -> Option<u8> {
+        match self.blocks.get(index)?.kind {
+            BlockKind::Heading(level) => Some(level),
+            _ => None,
+        }
+    }
+
+    /// The blocks a heading governs: the heading and everything after it up
+    /// to the next heading of the same or a higher level. An H2's section
+    /// includes its H3 subsections and ends at the next H2 (or H1). Any other
+    /// block's section is just that block.
+    pub fn section(&self, index: usize) -> Range<usize> {
+        let len = self.blocks.len();
+        let Some(level) = self.level(index) else { return index.min(len)..(index + 1).min(len) };
+        let end = (index + 1..len).find(|&j| self.level(j).is_some_and(|l| l <= level)).unwrap_or(len);
+        index..end
+    }
+
+    /// How much of block `index`'s section prints.
+    pub fn section_inclusion(&self, index: usize) -> Inclusion {
+        let blocks = &self.blocks[self.section(index)];
+        match blocks.iter().filter(|b| b.included).count() {
+            0 => Inclusion::Nothing,
+            n if n == blocks.len() => Inclusion::All,
+            _ => Inclusion::Partly,
+        }
+    }
+
+    /// Print or leave out a heading together with everything beneath it.
+    pub fn set_section_included(&mut self, index: usize, included: bool) {
+        let range = self.section(index);
+        for block in &mut self.blocks[range] {
+            block.included = included;
+        }
+    }
+
+    /// How deeply each block sits under headings: 0 for blocks before the
+    /// first heading and for top-level headings; a heading's contents are one
+    /// deeper than the heading.
+    pub fn depths(&self) -> Vec<usize> {
+        let mut open: Vec<u8> = Vec::new();
+        self.blocks
+            .iter()
+            .map(|block| match block.kind {
+                BlockKind::Heading(level) => {
+                    while open.last().is_some_and(|&l| l >= level) {
+                        open.pop();
+                    }
+                    open.push(level);
+                    open.len() - 1
+                }
+                _ => open.len(),
+            })
+            .collect()
+    }
+
+    /// Move a heading one step up or down **with its section**: past the
+    /// neighbouring section of the same level, or past a single block where
+    /// there's no such neighbour (which moves it out of, or into, the
+    /// surrounding section). Other blocks move like [`Draft::move_block`].
+    /// Returns the heading's new index.
+    pub fn move_section(&mut self, index: usize, up: bool) -> usize {
+        let Some(level) = self.level(index) else { return self.move_block(index, up) };
+        let section = self.section(index);
+        if up {
+            let Some(above) = index.checked_sub(1) else { return index };
+            // The nearest heading above at this level or higher: if it's at
+            // this level, its section ends right here and we swap with it.
+            let start = (0..index)
+                .rev()
+                .find(|&j| self.level(j).is_some_and(|l| l <= level))
+                .filter(|&j| self.level(j) == Some(level))
+                .unwrap_or(above);
+            self.blocks[start..section.end].rotate_left(index - start);
+            start
+        } else {
+            let next = section.end;
+            if next >= self.blocks.len() {
+                return index;
+            }
+            let next_end = if self.level(next) == Some(level) { self.section(next).end } else { next + 1 };
+            self.blocks[index..next_end].rotate_left(next - index);
+            index + (next_end - next)
         }
     }
 
@@ -483,6 +578,55 @@ pub fn markdown_to_html(md: &str, kind: BlockKind) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn outline() -> Draft {
+        let html = "<p>intro</p><h2>A</h2><p>a1</p><h3>A.1</h3><p>a11</p><h2>B</h2><p>b1</p><h2>C</h2><p>c1</p>";
+        Draft::from_article(html, Meta::default(), Format::default())
+    }
+
+    fn order(draft: &Draft) -> Vec<String> {
+        draft.blocks.iter().map(Block::preview).collect()
+    }
+
+    #[test]
+    fn headings_govern_everything_beneath_them() {
+        let mut d = outline();
+        assert_eq!(order(&d), ["intro", "A", "a1", "A.1", "a11", "B", "b1", "C", "c1"]);
+        assert_eq!(d.section(1), 1..5, "an H2 takes its H3 subsection with it");
+        assert_eq!(d.section(3), 3..5);
+        assert_eq!(d.section(7), 7..9, "the last section runs to the end");
+        assert_eq!(d.section(0), 0..1, "a paragraph is its own section");
+        assert_eq!(d.depths(), [0, 0, 1, 1, 2, 0, 1, 0, 1]);
+
+        d.set_section_included(1, false);
+        let printed: Vec<bool> = d.blocks.iter().map(|b| b.included).collect();
+        assert_eq!(printed, [true, false, false, false, false, true, true, true, true]);
+        assert_eq!(d.section_inclusion(1), Inclusion::Nothing);
+        d.blocks[4].included = true;
+        assert_eq!(d.section_inclusion(1), Inclusion::Partly);
+        assert_eq!(d.section_inclusion(3), Inclusion::Partly);
+        d.set_section_included(1, true);
+        assert_eq!(d.section_inclusion(1), Inclusion::All);
+        assert_eq!(d.section_inclusion(0), Inclusion::All);
+    }
+
+    #[test]
+    fn headings_move_with_their_sections() {
+        let mut d = outline();
+        assert_eq!(d.move_section(5, true), 1, "B jumps over the whole of A");
+        assert_eq!(order(&d), ["intro", "B", "b1", "A", "a1", "A.1", "a11", "C", "c1"]);
+        assert_eq!(d.move_section(3, false), 5, "A jumps over C");
+        assert_eq!(order(&d), ["intro", "B", "b1", "C", "c1", "A", "a1", "A.1", "a11"]);
+        // No sibling above: A.1 steps over a single block.
+        assert_eq!(d.move_section(7, true), 6);
+        assert_eq!(order(&d), ["intro", "B", "b1", "C", "c1", "A", "A.1", "a11", "a1"]);
+        // At the edges nothing moves; paragraphs still move one step.
+        assert_eq!(d.move_section(1, true), 0, "B steps above the intro paragraph");
+        let last = d.blocks.iter().position(|b| b.preview() == "A").unwrap();
+        assert_eq!(d.move_section(last, false), last, "the last section can't go lower");
+        assert_eq!(d.move_section(0, true), 0);
+        assert_eq!(d.move_section(2, false), 3);
+    }
 
     const HTML: &str = r#"<div><div class="intro"><h2>Why paper</h2><p>Paper is <strong>calm</strong>, see <a href="https://example.com/x">this</a>.</p></div>
         Loose <em>text</em> here.

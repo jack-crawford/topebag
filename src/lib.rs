@@ -20,6 +20,7 @@
 //! | [`extract`]   | Reader-mode extraction (title, byline, main content)         |
 //! | [`images`]    | Downloading, normalising and caching article images          |
 //! | [`document`]  | Editable drafts: blocks, edits, per-document format          |
+//! | [`edition`]   | Several articles printed together, newspaper style           |
 //! | [`convert`]   | Cleaned HTML → Typst markup                                  |
 //! | [`typeset`]   | Embedded Typst compiler: markup → pages → PDF / raster       |
 //! | [`library`]   | The on-disk library of saved documents                       |
@@ -38,6 +39,7 @@ pub mod autostart;
 pub mod browser;
 pub mod convert;
 pub mod document;
+pub mod edition;
 pub mod extract;
 pub mod fetch;
 pub mod images;
