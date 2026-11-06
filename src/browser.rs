@@ -37,31 +37,37 @@ pub fn find_browser() -> Option<PathBuf> {
 }
 
 fn candidates() -> Vec<PathBuf> {
-    let mut out = Vec::new();
     #[cfg(windows)]
     {
         let env = |k: &str| std::env::var_os(k).map(PathBuf::from);
+        let mut out = Vec::new();
         for base in [env("ProgramFiles(x86)"), env("ProgramFiles"), env("LOCALAPPDATA")].into_iter().flatten() {
             out.push(base.join(r"Microsoft\Edge\Application\msedge.exe"));
         }
         for base in [env("ProgramFiles"), env("ProgramFiles(x86)"), env("LOCALAPPDATA")].into_iter().flatten() {
             out.push(base.join(r"Google\Chrome\Application\chrome.exe"));
         }
+        out
     }
     #[cfg(target_os = "macos")]
     {
-        out.push("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge".into());
-        out.push("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome".into());
+        vec![
+            PathBuf::from("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
+            PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+        ]
     }
     #[cfg(all(unix, not(target_os = "macos")))]
     {
-        for name in ["microsoft-edge", "google-chrome", "google-chrome-stable", "chromium", "chromium-browser"] {
-            for dir in ["/usr/bin", "/usr/local/bin", "/snap/bin"] {
-                out.push(Path::new(dir).join(name));
-            }
-        }
+        let names = ["microsoft-edge", "google-chrome", "google-chrome-stable", "chromium", "chromium-browser"];
+        names
+            .iter()
+            .flat_map(|name| ["/usr/bin", "/usr/local/bin", "/snap/bin"].map(|dir| Path::new(dir).join(name)))
+            .collect()
     }
-    out
+    #[cfg(not(any(windows, unix)))]
+    {
+        Vec::new()
+    }
 }
 
 /// Command-line arguments for a headless DOM dump.

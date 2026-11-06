@@ -6,13 +6,18 @@
 
 use std::io::{BufRead, BufReader, Cursor, Write};
 use std::net::TcpListener;
+#[cfg(windows)]
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(windows)]
+use std::time::Instant;
 
 use topebag::instapaper::{self, QueueState};
 use topebag::library::{EntryKind, Library};
-use topebag::pipeline::{self, PrintTarget, Stage};
+#[cfg(windows)]
+use topebag::pipeline::PrintTarget;
+use topebag::pipeline::{self, Stage};
 use topebag::settings::{BrowserMode, Format, Paper, Settings};
 use url::Url;
 
